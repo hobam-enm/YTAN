@@ -621,7 +621,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             return None
         ch_info = ch_res['items'][0]; ch_name = ch_info['snippet']['title']
         uploads_id = ch_info['contentDetails']['relatedPlaylists']['uploads']
-        cache_file = f"cache_nov_{token_file}"
+        cache_file = f"cache_{token_file}"
         cached_videos = []
         
         cached_ids = set()
@@ -892,7 +892,7 @@ if 'channels_data' not in st.session_state or not st.session_state['channels_dat
     token_files = glob.glob("token_*.json")
     temp_data = []
     for tf in token_files:
-        cf = f"cache_nov_{tf}"
+        cf = f"cache_{tf}"
         if os.path.exists(cf):
              with open(cf, 'r', encoding='utf-8') as f:
                 try:
