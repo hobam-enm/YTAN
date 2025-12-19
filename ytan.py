@@ -509,57 +509,87 @@ def get_country_map(country_stats):
     return fig
 
 def get_daily_trend_chart(daily_stats, recent_gap=0):
+    """
+    daily_stats: Analytics API 일별 조회수 (딕셔너리)
+    recent_gap: Data API(실시간) 총합 - Analytics 총합
+    """
     if not daily_stats: return None
     
-    dates = sorted(daily_stats.keys())
-    views = [daily_stats[d] for d in dates]
+    # 1. 날짜순 정렬 및 데이터 추출
+    sorted_dates = sorted(daily_stats.keys())
+    daily_views = [daily_stats[d] for d in sorted_dates]
+    
+    # 2. 누적 조회수(Cumulative) 계산
+    cumulative_views = []
+    current_sum = 0
+    for v in daily_views:
+        current_sum += v
+        cumulative_views.append(current_sum)
     
     fig = go.Figure()
     
-    # 확정된 Analytics 데이터
+    # [A] 확정된 과거 데이터 (실선 - 보라색)
     fig.add_trace(go.Scatter(
-        x=dates, y=views, mode='lines+markers', name='확정 조회수',
-        line=dict(color='#6c5ce7', width=3), marker=dict(size=6)
+        x=sorted_dates, 
+        y=cumulative_views, 
+        mode='lines+markers',
+        name='누적 조회수 (확정)',
+        line=dict(color='#6c5ce7', width=3),
+        marker=dict(size=6),
+        hovertemplate='%{x}<br>누적: %{y:,}회<extra></extra>'
     ))
     
-    # 실시간 데이터 연결
-    if recent_gap > 0 and dates:
-        last_date_str = dates[-1]
-        last_val = views[-1]
+    # [B] 실시간 구간 연결 여부 판단 (핵심 수정!)
+    # 조건: 데이터의 마지막 날짜가 '오늘' 기준으로 3일 이내일 때만 "실시간 현황"으로 간주하고 점선을 그림.
+    # (예: 분석기간이 12/1~12/9이고 오늘이 12/19면 -> 10일 차이나므로 점선 안 그림)
+    
+    if recent_gap > 0 and sorted_dates:
+        last_date_str = sorted_dates[-1]
+        last_cum_val = cumulative_views[-1]
         
         today_dt = datetime.today()
         last_anl_dt = datetime.strptime(last_date_str, "%Y-%m-%d")
         
-        if today_dt.date() <= last_anl_dt.date():
-            target_dt = last_anl_dt + timedelta(days=1)
-        else:
-            target_dt = today_dt
+        # [수정] 차이가 3일(72시간) 이내인 경우에만 "최신 데이터 공백"으로 보고 점선을 잇는다.
+        # 그 이상 차이나면 그냥 "과거 조회"이므로 점선 없이 끝낸다.
+        days_diff = (today_dt - last_anl_dt).days
+        
+        if days_diff <= 3:
+            # 도착점 설정 (오늘)
+            target_date_str = today_dt.strftime("%Y-%m-%d")
+            final_total_val = last_cum_val + recent_gap
             
-        target_date_str = target_dt.strftime("%Y-%m-%d")
-        
-        fig.add_trace(go.Scatter(
-            x=[last_date_str, target_date_str],
-            y=[last_val, recent_gap],
-            mode='lines+markers',
-            name='실시간(추정)',
-            line=dict(color='#ff7675', width=3, dash='dot'),
-            marker=dict(size=8, symbol='star')
-        ))
-        
-        fig.add_annotation(
-            x=target_date_str, y=recent_gap,
-            text="Realtime (Est.)", showarrow=True, arrowhead=1,
-            yshift=10, font=dict(color="#d63031", size=10)
-        )
+            # 마지막 날짜가 오늘이 아닐 때만 그림
+            if last_date_str != target_date_str:
+                fig.add_trace(go.Scatter(
+                    x=[last_date_str, target_date_str],
+                    y=[last_cum_val, final_total_val],
+                    mode='lines+markers',
+                    name='실시간 추이 (최근)',
+                    line=dict(color='#ff7675', width=3, dash='dot'), # 붉은 점선
+                    marker=dict(size=6, symbol='circle-open'),
+                    hovertemplate=f'<b>실시간(추정)</b><br>현재 총합: %{{y:,}}회<br>(최근 +{recent_gap:,}회 증가)<extra></extra>'
+                ))
+                
+                # 화살표/텍스트
+                fig.add_annotation(
+                    x=target_date_str, y=final_total_val,
+                    text=f"Now (+{recent_gap:,})",
+                    showarrow=True, arrowhead=2,
+                    ax=0, ay=-20,
+                    font=dict(color="#d63031", size=11, weight="bold")
+                )
 
     fig.update_layout(
-        margin=dict(l=20, r=20, t=20, b=20),
+        title="📈 누적 조회수 성장 추이",
+        margin=dict(l=20, r=20, t=40, b=20),
         height=350, 
-        xaxis=dict(title="날짜", tickformat="%Y-%m-%d"),
-        yaxis=dict(title="조회수", tickformat=","),
+        xaxis=dict(title=None, tickformat="%m-%d"),
+        yaxis=dict(title="총 조회수", tickformat=","),
         hovermode="x unified",
         paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)'
+        plot_bgcolor='rgba(0,0,0,0)',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     return fig
 
