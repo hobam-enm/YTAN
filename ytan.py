@@ -621,16 +621,22 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             return None
         ch_info = ch_res['items'][0]; ch_name = ch_info['snippet']['title']
         uploads_id = ch_info['contentDetails']['relatedPlaylists']['uploads']
-        cache_file = f"cache_{token_file}"
-        cached_videos = []
         
+        # [수정] 파일명 규칙 변경 (nov 제거)
+        cache_file = f"cache_{token_file}"
+        
+        cached_videos = []
         cached_ids = set()
         
         if not force_rescan and os.path.exists(cache_file):
             with open(cache_file, 'r', encoding='utf-8') as f: cached_videos = json.load(f)
             cached_ids = {v['id'] for v in cached_videos}
             status_box.info(f"🔄 [{ch_name}] 확인 중...")
-        else: status_box.info(f"⏳ [{ch_name}] 스캔 시작")
+        else: 
+            # 재수집 시에도 기존 파일이 있으면 일단 읽어둠 (과거 데이터 보존용)
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r', encoding='utf-8') as f: cached_videos = json.load(f)
+            status_box.info(f"⏳ [{ch_name}] 스캔 시작")
         
         new_videos = []; next_page_token = None; stop_scanning = False
         
@@ -642,6 +648,8 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
                 title = item['snippet']['title']
                 desc = item['snippet']['description']
                 p_at = item['snippet']['publishedAt']
+                
+                # 마지노선 날짜보다 옛날 영상이면 수집 중단
                 if p_at < limit_date: stop_scanning = True; break
                 
                 if not force_rescan and vid in cached_ids: 
@@ -653,13 +661,20 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             if not res.get('nextPageToken'): stop_scanning = True
             next_page_token = res.get('nextPageToken')
             if not next_page_token: stop_scanning = True
-        final_list = new_videos + cached_videos if not force_rescan else new_videos
+        
+        # [수정] 데이터 병합 로직 개선 (과거 데이터 보존)
+        if force_rescan:
+            # 전체 재수집(force_rescan)이라도, 수집 범위(limit_date)보다 더 옛날 데이터는 캐시에서 살려둬야 함
+            preserved_videos = [v for v in cached_videos if v['date'] < limit_date]
+            final_list = new_videos + preserved_videos
+        else:
+            final_list = new_videos + cached_videos
         
         if new_videos or force_rescan:
             with open(cache_file, 'w', encoding='utf-8') as f: 
                 json.dump(final_list, f, ensure_ascii=False, indent=2)
             
-            # [추가] 깃허브 클라우드 저장 (영구 저장)
+            # 깃허브 클라우드 저장 (영구 저장)
             upload_to_github(cache_file, final_list)
             
             status_box.success(f"✅ **[{ch_name}]** 완료 (+{len(new_videos)})")
@@ -701,8 +716,22 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     
     top_video_stats = []
     
-    now_utc = datetime.utcnow()
-    threshold_dt = now_utc - timedelta(hours=48)
+    # [수정] 하이브리드 로직을 위한 날짜 계산 준비
+    today_date = datetime.now().date()
+    
+    # 문자열 날짜를 객체로 변환
+    if isinstance(anl_end, str):
+        anl_end_date = datetime.strptime(anl_end, "%Y-%m-%d").date()
+    else:
+        anl_end_date = anl_end
+
+    if isinstance(anl_start, str):
+        anl_start_date = datetime.strptime(anl_start, "%Y-%m-%d").date()
+    else:
+        anl_start_date = anl_start
+        
+    # [핵심] "오늘, 어제, 그제(D-2)"까지 포함된 조회라면 Data API를 신뢰 (Analytics는 지연 이슈 있음)
+    use_hybrid_logic = anl_end_date >= (today_date - timedelta(days=2))
     
     batch_size = 50 
     for i in range(0, len(target_ids), batch_size):
@@ -765,13 +794,16 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 v_date_str = video_date_map.get(vid_id)
                 if not v_date_str: continue
                 
-                v_upload_dt = datetime.strptime(v_date_str, "%Y-%m-%dT%H:%M:%SZ")
-                is_recent = v_upload_dt > threshold_dt
+                # 영상 업로드일 파싱
+                v_upload_dt = parse_utc_to_kst_date(v_date_str)
+                if isinstance(v_upload_dt, datetime): v_upload_dt = v_upload_dt.date()
 
+                # Analytics API 값 (기간 필터링됨)
                 a_v = anl_views_map.get(vid_id, 0)
                 a_l = anl_likes_map.get(vid_id, 0)
                 a_pct = anl_retention_map.get(vid_id, 0)
                 
+                # Data API 값 (실시간 Total)
                 stats = rt_stats_map.get(vid_id, {})
                 rt_v = int(stats.get('viewCount', 0))
                 rt_l = int(stats.get('likeCount', 0))
@@ -779,12 +811,33 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 final_v = 0
                 final_l = 0
                 
-                if is_recent:
-                    final_v = rt_v
-                    final_l = rt_l
+                # [수정] 하이브리드 로직 적용
+                if use_hybrid_logic:
+                    # [Case A] 최신 조회 (오늘/어제/그제 포함) -> Data API 신뢰
+                    # 분석 기간이 영상 업로드 시점부터 시작되거나(전기간), 영상이 더 늦게 올라온 경우
+                    # => Data API Total이 곧 구간 조회수임 (뺄 게 없음)
+                    if v_upload_dt >= anl_start_date:
+                        final_v = rt_v
+                        final_l = rt_l
+                    else:
+                        # 영상은 옛날에 올라왔지만 최신 기간을 조회하는 경우
+                        # Analytics 값이 있으면(0이 아니면) 쓰고, 아직 집계 안 돼서 0이면 Data API 사용
+                        # (최신 데이터 누락 방지 우선)
+                        if a_v > 0:
+                            final_v = a_v
+                            final_l = a_l
+                        else:
+                            final_v = rt_v
+                            final_l = rt_l
                 else:
+                    # [Case B] 완전히 과거 기간 조회 -> Analytics API 신뢰
                     final_v = a_v
                     final_l = a_l
+
+                # [안전장치] 어떤 경우든 값이 0인데 실시간 API에 값이 있다면 채워넣음
+                if final_v == 0 and rt_v > 0 and use_hybrid_logic:
+                    final_v = rt_v
+                    final_l = rt_l
                 
                 total_views += final_v
                 total_likes += final_l
