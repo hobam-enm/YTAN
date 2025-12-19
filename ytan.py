@@ -528,7 +528,7 @@ def get_daily_trend_chart(daily_stats, recent_gap=0):
     
     fig = go.Figure()
     
-    # [A] 확정된 과거 데이터 (실선 - 보라색)
+    # [A] 확정된 과거 데이터 (실선)
     fig.add_trace(go.Scatter(
         x=sorted_dates, 
         y=cumulative_views, 
@@ -539,10 +539,7 @@ def get_daily_trend_chart(daily_stats, recent_gap=0):
         hovertemplate='%{x}<br>누적: %{y:,}회<extra></extra>'
     ))
     
-    # [B] 실시간 구간 연결 여부 판단 (핵심 수정!)
-    # 조건: 데이터의 마지막 날짜가 '오늘' 기준으로 3일 이내일 때만 "실시간 현황"으로 간주하고 점선을 그림.
-    # (예: 분석기간이 12/1~12/9이고 오늘이 12/19면 -> 10일 차이나므로 점선 안 그림)
-    
+    # [B] 실시간 구간 연결 (최근 3일 이내일 때만)
     if recent_gap > 0 and sorted_dates:
         last_date_str = sorted_dates[-1]
         last_cum_val = cumulative_views[-1]
@@ -550,28 +547,22 @@ def get_daily_trend_chart(daily_stats, recent_gap=0):
         today_dt = datetime.today()
         last_anl_dt = datetime.strptime(last_date_str, "%Y-%m-%d")
         
-        # [수정] 차이가 3일(72시간) 이내인 경우에만 "최신 데이터 공백"으로 보고 점선을 잇는다.
-        # 그 이상 차이나면 그냥 "과거 조회"이므로 점선 없이 끝낸다.
-        days_diff = (today_dt - last_anl_dt).days
-        
-        if days_diff <= 3:
-            # 도착점 설정 (오늘)
+        # 차이가 3일 이내인 경우에만 실시간 점선 연결
+        if (today_dt - last_anl_dt).days <= 3:
             target_date_str = today_dt.strftime("%Y-%m-%d")
             final_total_val = last_cum_val + recent_gap
             
-            # 마지막 날짜가 오늘이 아닐 때만 그림
             if last_date_str != target_date_str:
                 fig.add_trace(go.Scatter(
                     x=[last_date_str, target_date_str],
                     y=[last_cum_val, final_total_val],
                     mode='lines+markers',
                     name='실시간 추이 (최근)',
-                    line=dict(color='#ff7675', width=3, dash='dot'), # 붉은 점선
+                    line=dict(color='#ff7675', width=3, dash='dot'),
                     marker=dict(size=6, symbol='circle-open'),
                     hovertemplate=f'<b>실시간(추정)</b><br>현재 총합: %{{y:,}}회<br>(최근 +{recent_gap:,}회 증가)<extra></extra>'
                 ))
                 
-                # 화살표/텍스트
                 fig.add_annotation(
                     x=target_date_str, y=final_total_val,
                     text=f"Now (+{recent_gap:,})",
@@ -580,11 +571,22 @@ def get_daily_trend_chart(daily_stats, recent_gap=0):
                     font=dict(color="#d63031", size=11, weight="bold")
                 )
 
+    # [X축 중복 방지 로직]
+    # 조회 기간이 짧을 때(예: 30일 이내)는 강제로 '1일 1눈금(D1)'을 적용해 중복을 막습니다.
+    # 기간이 길면(예: 1년) 자동(Auto)으로 둬야 겹치지 않습니다.
+    dtick_setting = None
+    if len(sorted_dates) <= 31: 
+        dtick_setting = "D1"  # 1일 1눈금 강제 (중복 해결)
+
     fig.update_layout(
         title="📈 누적 조회수 성장 추이",
         margin=dict(l=20, r=20, t=40, b=20),
         height=350, 
-        xaxis=dict(title=None, tickformat="%m-%d"),
+        xaxis=dict(
+            title=None, 
+            tickformat="%m-%d", 
+            dtick=dtick_setting  # [수정] 여기가 핵심입니다!
+        ),
         yaxis=dict(title="총 조회수", tickformat=","),
         hovermode="x unified",
         paper_bgcolor='rgba(0,0,0,0)',
