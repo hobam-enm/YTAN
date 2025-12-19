@@ -691,6 +691,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     id_map = {} 
     video_date_map = {}
     
+    # 1. 영상 필터링 (업로드 기간 기준)
     for v in videos:
         t_match = norm_keyword in normalize_text(v['title'])
         d_match = norm_keyword in normalize_text(v.get('description', ''))
@@ -716,10 +717,9 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     
     top_video_stats = []
     
-    # [수정] 하이브리드 로직을 위한 날짜 계산 준비
+    # 날짜 객체 변환 및 하이브리드 모드 판단
     today_date = datetime.now().date()
     
-    # 문자열 날짜를 객체로 변환
     if isinstance(anl_end, str):
         anl_end_date = datetime.strptime(anl_end, "%Y-%m-%d").date()
     else:
@@ -730,7 +730,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     else:
         anl_start_date = anl_start
         
-    # [핵심] "오늘, 어제, 그제(D-2)"까지 포함된 조회라면 Data API를 신뢰 (Analytics는 지연 이슈 있음)
+    # [핵심 기준] 분석 종료일이 '그제(D-2)' 이후라면 하이브리드 모드(Data API 사용) 진입
     use_hybrid_logic = anl_end_date >= (today_date - timedelta(days=2))
     
     batch_size = 50 
@@ -738,21 +738,23 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         batch_ids = target_ids[i : i + batch_size]
         vid_str = ",".join(batch_ids)
         
+        # --- Batch Analytics (공통 지표) ---
         anl_views_map = {}
         anl_likes_map = {}
         anl_retention_map = {}
         
         try:
-            r_b = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
-            if 'rows' in r_b and r_b['rows']:
-                total_shares += r_b['rows'][0][0]
-
+            # 1. 기간 내 기본 조회수 (Batch)
             r_v = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
             if 'rows' in r_v and r_v['rows']:
                 for r in r_v['rows']:
                     anl_views_map[r[0]] = r[1]
                     anl_likes_map[r[0]] = r[2]
                     anl_retention_map[r[0]] = r[3]
+            
+            # 2. 기타 통계 (공유, 데모, 트래픽 등) - 이건 Analytics 의존 (실시간 불가 영역)
+            r_b = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
+            if 'rows' in r_b and r_b['rows']: total_shares += r_b['rows'][0][0]
 
             r_d = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='viewerPercentage', dimensions='ageGroup,gender', filters=f'video=={vid_str}').execute()
             batch_total_view_anl = sum(anl_views_map.values())
@@ -777,9 +779,10 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
             r_day = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
             if 'rows' in r_day and r_day['rows']:
                 for r in r_day['rows']: daily[r[0]] += r[1]
-        
+
         except: pass
 
+        # --- Data API (Realtime) & Calculation ---
         try:
             rt_res = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
             
@@ -794,48 +797,79 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 v_date_str = video_date_map.get(vid_id)
                 if not v_date_str: continue
                 
-                # 영상 업로드일 파싱
                 v_upload_dt = parse_utc_to_kst_date(v_date_str)
                 if isinstance(v_upload_dt, datetime): v_upload_dt = v_upload_dt.date()
 
-                # Analytics API 값 (기간 필터링됨)
-                a_v = anl_views_map.get(vid_id, 0)
+                # 1. 기본값 준비
+                a_v = anl_views_map.get(vid_id, 0) # Analytics 기간 조회수
                 a_l = anl_likes_map.get(vid_id, 0)
                 a_pct = anl_retention_map.get(vid_id, 0)
                 
-                # Data API 값 (실시간 Total)
                 stats = rt_stats_map.get(vid_id, {})
-                rt_v = int(stats.get('viewCount', 0))
+                rt_v = int(stats.get('viewCount', 0)) # Data API 평생 조회수
                 rt_l = int(stats.get('likeCount', 0))
                 
                 final_v = 0
                 final_l = 0
                 
-                # [수정] 하이브리드 로직 적용
+                # ==========================================================
+                # 🔥 [수정] 호범's 천재적 뺄셈 로직 적용 (Accuracy Mode)
+                # ==========================================================
                 if use_hybrid_logic:
-                    # [Case A] 최신 조회 (오늘/어제/그제 포함) -> Data API 신뢰
-                    # 분석 기간이 영상 업로드 시점부터 시작되거나(전기간), 영상이 더 늦게 올라온 경우
-                    # => Data API Total이 곧 구간 조회수임 (뺄 게 없음)
+                    # Case 1: 영상이 분석 시작일 이후에 올라옴 (완전 최신)
                     if v_upload_dt >= anl_start_date:
+                        # 평생 조회수 = 기간 내 조회수 (뺄 게 없음)
                         final_v = rt_v
                         final_l = rt_l
+                    
+                    # Case 2 (3-b): 영상은 옛날 건데, 최신 성과를 보고 싶음 (역주행 고려)
                     else:
-                        # 영상은 옛날에 올라왔지만 최신 기간을 조회하는 경우
-                        # Analytics 값이 있으면(0이 아니면) 쓰고, 아직 집계 안 돼서 0이면 Data API 사용
-                        # (최신 데이터 누락 방지 우선)
-                        if a_v > 0:
-                            final_v = a_v
-                            final_l = a_l
-                        else:
-                            final_v = rt_v
-                            final_l = rt_l
+                        # "실시간 Total" - "분석 시작일 전날까지의 과거 누적치"
+                        deduct_end_date = anl_start_date - timedelta(days=1)
+                        deduct_start_str = v_upload_dt.strftime("%Y-%m-%d")
+                        deduct_end_str = deduct_end_date.strftime("%Y-%m-%d")
+                        
+                        past_views = 0
+                        past_likes = 0
+                        
+                        # 과거 데이터 조회를 위해 API 추가 호출 (정확도를 위한 투자)
+                        try:
+                            # 쿼리 최적화: 날짜가 꼬이지 않았는지 확인
+                            if v_upload_dt <= deduct_end_date:
+                                r_past = yt_anl.reports().query(
+                                    ids='channel==MINE', 
+                                    startDate=deduct_start_str, 
+                                    endDate=deduct_end_str, 
+                                    metrics='views,likes', 
+                                    filters=f'video=={vid_id}'
+                                ).execute()
+                                if 'rows' in r_past and r_past['rows']:
+                                    past_views = r_past['rows'][0][0]
+                                    past_likes = r_past['rows'][0][1]
+                        except:
+                            # 에러나면 차선책: 그냥 Analytics 기간 조회수 사용하거나 0 처리
+                            past_views = 0 # 뺄셈 실패 시 안전하게 보수적 접근 (혹은 a_v 사용)
+
+                        # 계산: (현재 Total) - (과거 누적) = (최근 기간 조회수)
+                        # 음수 방지 (가끔 싱크 문제로 꼬일 때 대비)
+                        final_v = max(0, rt_v - past_views)
+                        final_l = max(0, rt_l - past_likes)
+
+                        # 안전장치: 계산값이 0이거나 이상하면 기존 Analytics 값(a_v)과 비교해서 큰 거 사용
+                        # 이유: 과거 API가 실패해서 past_views가 0이면 final_v가 rt_v(Total)이 되어버림 (과대계상)
+                        # 따라서 past_views를 못 구했으면 a_v(Analytics)로 회귀하는 게 안전함
+                        if past_views == 0 and a_v > 0 and final_v == rt_v:
+                             final_v = a_v
+                             final_l = a_l
+
                 else:
                     # [Case B] 완전히 과거 기간 조회 -> Analytics API 신뢰
                     final_v = a_v
                     final_l = a_l
 
-                # [안전장치] 어떤 경우든 값이 0인데 실시간 API에 값이 있다면 채워넣음
+                # [최종 안전장치]
                 if final_v == 0 and rt_v > 0 and use_hybrid_logic:
+                    # 뭔가 0인데 실시간은 살아있다? -> 누락 방지를 위해 Total이라도 보여줌 (0보단 나음)
                     final_v = rt_v
                     final_l = rt_l
                 
@@ -852,9 +886,9 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                     top_video_stats.append({
                         'id': vid_id,
                         'title': id_map.get(vid_id, 'Unknown'),
-                        'views': rt_v,
+                        'views': rt_v, # 리스트에는 항상 Total 조회수 표시 (참고용)
                         'likes': rt_l,
-                        'period_views': final_v,
+                        'period_views': final_v, # 여기가 분석 기간 조회수
                         'avg_pct': a_pct if a_pct > 0 else None,
                         'duration_min': parse_duration_to_minutes(rt_content_map.get(vid_id, {}).get('duration'))
                     })
