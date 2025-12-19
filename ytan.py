@@ -4,20 +4,23 @@ import glob
 import json
 import time
 import re
+import hashlib
+import datetime
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import google.oauth2.credentials
 import googleapiclient.discovery
 import google.auth.transport.requests
+import extra_streamlit_components as stx  # [추가] 쿠키 매니저
+
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 from datetime import datetime, timedelta
+from github import Github, GithubException # PyGithub
 
 # region [1. 설정 및 상수 (Config & Constants)]
-# ==========================================
-# 기본 페이지 설정 및 디자인, 상수 정의
 # ==========================================
 st.set_page_config(
     page_title="Drama YouTube Insight", 
@@ -25,23 +28,128 @@ st.set_page_config(
     layout="wide", 
     initial_sidebar_state="expanded"
 )
+# endregion
 
+
+# region [1-1. 입장게이트 (보안 인증)]
+# ==========================================
+# Dashboard.py에서 이식된 쿠키/비밀번호 인증 로직
+# ==========================================
+
+def _rerun():
+    """스트림릿 버전 호환 리런 함수"""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+def get_cookie_manager():
+    # 쿠키 매니저는 키(Key)가 고유해야 함
+    return stx.CookieManager(key="yt_auth_cookie_manager")
+
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(str(password).encode()).hexdigest()
+
+def check_password_with_cookie() -> bool:
+    """
+    1. Secrets 비밀번호 확인
+    2. 쿠키(과거 로그인) 확인
+    3. 세션(현재 로그인) 확인
+    4. 실패 시 로그인창 띄우고 False 반환 -> 앱 중단
+    """
+    cookie_manager = get_cookie_manager()
+    
+    # Secrets에서 비밀번호 가져오기 (없으면 에러)
+    # secrets.toml 파일에 [general] 섹션 혹은 최상단에 DASHBOARD_PASSWORD = "..." 가 있어야 함
+    secret_pwd = st.secrets.get("DASHBOARD_PASSWORD")
+    if not secret_pwd:
+        # 호환성을 위해 general 섹션도 체크
+        if "general" in st.secrets:
+            secret_pwd = st.secrets["general"].get("DASHBOARD_PASSWORD")
+            
+    if not secret_pwd:
+        st.error("🔒 설정 오류: Secrets에 'DASHBOARD_PASSWORD'가 설정되지 않았습니다.")
+        st.stop()
+        
+    hashed_secret = _hash_password(str(secret_pwd))
+    
+    # 쿠키 읽기
+    cookies = cookie_manager.get_all()
+    COOKIE_NAME = "yt_dashboard_auth"
+    current_token = cookies.get(COOKIE_NAME)
+    
+    # 인증 검사
+    is_cookie_valid = (current_token == hashed_secret)
+    is_session_valid = st.session_state.get("auth_success", False)
+    
+    if is_cookie_valid or is_session_valid:
+        if is_cookie_valid and not is_session_valid:
+            st.session_state["auth_success"] = True
+        return True
+
+    # 로그인 UI
+    st.markdown("#### 🔒 Access Restricted")
+    st.caption("관계자 외 접근이 제한된 페이지입니다.")
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        input_pwd = st.text_input("Password", type="password", key="login_pw_input")
+        login_btn = st.button("Login", type="primary", use_container_width=True)
+
+    if login_btn:
+        if _hash_password(input_pwd) == hashed_secret:
+            # 쿠키 굽기 (1일 유효)
+            expires = datetime.now() + timedelta(days=1)
+            cookie_manager.set(COOKIE_NAME, hashed_secret, expires_at=expires)
+            
+            st.session_state["auth_success"] = True
+            st.success("✅ 인증 성공")
+            time.sleep(0.5)
+            _rerun()
+        else:
+            st.error("❌ 비밀번호가 일치하지 않습니다.")
+            
+    return False
+
+# 🛑 [중요] 여기서 인증 실패 시 앱 실행을 멈춤
+if not check_password_with_cookie():
+    st.stop()
+
+# ==========================================
+# 인증 통과 후 실행되는 영역
+# ==========================================
+# endregion
+
+
+# region [1-2. 배포 환경 설정 (Secrets 복원)]
+# ==========================================
+# Streamlit Secrets에 저장된 토큰 정보를 읽어 로컬 파일로 복원
+if "tokens" in st.secrets:
+    for file_name, content in st.secrets["tokens"].items():
+        if not file_name.endswith(".json"):
+            file_name += ".json"
+        # 파일이 없으면 생성
+        if not os.path.exists(file_name):
+            with open(file_name, "w", encoding='utf-8') as f:
+                f.write(content)
+# endregion
+
+
+# region [1-3. 디자인 및 상수]
+# ==========================================
 # UI 디자인 CSS
 custom_css = """
     <style>
-        /* 1. 헤더 투명화 및 불필요 요소 숨김 (사이드바 버튼 유지) */
+        /* 헤더 투명화 */
         header[data-testid="stHeader"] { background: transparent; }
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
         [data-testid="stDecoration"] {display: none;}
         
-        /* 2. 메인 컨텐츠 여백 조정 */
         .block-container { padding-top: 1rem; padding-bottom: 3rem; }
-
-        /* 3. 앱 배경 설정 */
         .stApp { background-color: #f8f9fa; }
 
-        /* 4. 카드 및 메트릭 스타일 */
+        /* 카드 및 메트릭 스타일 */
         div[data-testid="stMetric"] {
             background-color: white;
             padding: 15px;
@@ -86,14 +194,11 @@ ISO_MAPPING = {
 
 # region [2. 유틸리티 함수 (Utilities)]
 # ==========================================
-# 텍스트 정제, 숫자 포맷팅, 날짜 변환 등 헬퍼 함수
-# ==========================================
 def normalize_text(text):
     if not text: return ""
     return re.sub(r'[^a-zA-Z0-9가-힣]', '', text).lower()
 
 def format_korean_number(num):
-    """숫자를 '1억 2345만 6789회' 형태로 변환"""
     if num == 0: return "0회"
     s = ""
     if num >= 100000000:
@@ -127,7 +232,6 @@ def parse_utc_to_kst_date(utc_str):
         return dt_kst.date()
     except: return None
 
-# [신규] 영상 길이 파싱 함수 (PT1H2M10S -> 분 단위 변환)
 def parse_duration_to_minutes(duration_str):
     if not duration_str: return 0.0
     pattern = re.compile(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?')
@@ -136,12 +240,46 @@ def parse_duration_to_minutes(duration_str):
     h, m, s = match.groups()
     total_sec = (int(h or 0) * 3600) + (int(m or 0) * 60) + (int(s or 0))
     return round(total_sec / 60, 1)
+
+# [Github 자동 업로드 함수]
+def upload_to_github(file_path, content_list):
+    """
+    로컬에서 생성된 캐시 데이터를 GitHub 리포지토리에 영구 저장(Commit & Push)합니다.
+    """
+    try:
+        if "github" not in st.secrets: return 
+        
+        # 1. 시크릿에서 설정 로드
+        gh_token = st.secrets["github"]["token"]
+        gh_repo = st.secrets["github"]["repo_name"]
+        gh_branch = st.secrets["github"]["branch"]
+
+        # 2. 깃허브 연결
+        g = Github(gh_token)
+        repo = g.get_repo(gh_repo)
+        
+        # 3. 데이터 직렬화 (JSON 변환)
+        json_content = json.dumps(content_list, ensure_ascii=False, indent=2)
+        commit_message = f"Update cache: {file_path} (via Streamlit App)"
+        
+        # 4. 파일 업로드 (생성 또는 수정)
+        try:
+            # 파일이 이미 있는지 확인 (브랜치 지정)
+            contents = repo.get_contents(file_path, ref=gh_branch)
+            # 있으면 수정 (Update)
+            repo.update_file(contents.path, commit_message, json_content, contents.sha, branch=gh_branch)
+            print(f"✅ GitHub Updated: {file_path}")
+        except GithubException:
+            # 없으면 생성 (Create)
+            repo.create_file(file_path, commit_message, json_content, branch=gh_branch)
+            print(f"✅ GitHub Created: {file_path}")
+            
+    except Exception as e:
+        print(f"❌ GitHub Upload Error: {e}")
 # endregion
 
 
 # region [3. 시각화 함수 (Visualization)]
-# ==========================================
-# Plotly를 이용한 차트 생성 함수들
 # ==========================================
 def get_pyramid_chart_and_df(stats_dict, total_views):
     if not stats_dict: return None, None, ""
@@ -371,11 +509,6 @@ def get_country_map(country_stats):
     return fig
 
 def get_daily_trend_chart(daily_stats, recent_gap=0):
-    """
-    daily_stats: Analytics API 일별 조회수
-    recent_gap: Data API(실시간) 총합 - Analytics 총합
-    """
-    # [1] Analytics 데이터(daily_stats)가 없으면, 리얼타임 데이터가 있어도 차트 생성 X
     if not daily_stats: return None
     
     dates = sorted(daily_stats.keys())
@@ -383,19 +516,17 @@ def get_daily_trend_chart(daily_stats, recent_gap=0):
     
     fig = go.Figure()
     
-    # [2] 확정된 Analytics 데이터 (실선 - 보라색)
+    # 확정된 Analytics 데이터
     fig.add_trace(go.Scatter(
         x=dates, y=views, mode='lines+markers', name='확정 조회수',
         line=dict(color='#6c5ce7', width=3), marker=dict(size=6)
     ))
     
-    # [3] 실시간 데이터 연결 (있을 경우만)
+    # 실시간 데이터 연결
     if recent_gap > 0 and dates:
         last_date_str = dates[-1]
         last_val = views[-1]
         
-        # 날짜 충돌 방지: 리얼타임 포인트는 무조건 마지막 Analytics 날짜보다 미래여야 함
-        # 오늘 날짜를 구하되, 마지막 Analytics 날짜와 같거나 작으면 하루 뒤로 설정
         today_dt = datetime.today()
         last_anl_dt = datetime.strptime(last_date_str, "%Y-%m-%d")
         
@@ -406,13 +537,12 @@ def get_daily_trend_chart(daily_stats, recent_gap=0):
             
         target_date_str = target_dt.strftime("%Y-%m-%d")
         
-        # 점선 그래프 추가 (마지막 확정일 ~ 타겟일)
         fig.add_trace(go.Scatter(
             x=[last_date_str, target_date_str],
             y=[last_val, recent_gap],
             mode='lines+markers',
             name='실시간(추정)',
-            line=dict(color='#ff7675', width=3, dash='dot'), # 붉은 점선
+            line=dict(color='#ff7675', width=3, dash='dot'),
             marker=dict(size=8, symbol='star')
         ))
         
@@ -422,12 +552,11 @@ def get_daily_trend_chart(daily_stats, recent_gap=0):
             yshift=10, font=dict(color="#d63031", size=10)
         )
 
-    # [4] Y축 포맷 설정 (콤마)
     fig.update_layout(
         margin=dict(l=20, r=20, t=20, b=20),
         height=350, 
         xaxis=dict(title="날짜", tickformat="%Y-%m-%d"),
-        yaxis=dict(title="조회수", tickformat=","), # #,### 포맷
+        yaxis=dict(title="조회수", tickformat=","),
         hovermode="x unified",
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)'
@@ -465,8 +594,6 @@ def get_efficiency_scatter(video_details):
 
 # region [4. API 및 데이터 처리 (API & Data Processing)]
 # ==========================================
-# Google API 인증, 데이터 동기화, 분석 로직
-# ==========================================
 def get_creds_from_file(token_filename):
     creds = None
     if os.path.exists(token_filename):
@@ -481,7 +608,6 @@ def get_creds_from_file(token_filename):
     return creds
 
 def process_sync_channel(token_file, limit_date, status_box, force_rescan):
-    # ... [이전 코드와 동일] ...
     file_label = os.path.basename(token_file).replace("token_", "").replace(".json", "")
     creds = get_creds_from_file(token_file)
     if not creds: 
@@ -528,8 +654,14 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             next_page_token = res.get('nextPageToken')
             if not next_page_token: stop_scanning = True
         final_list = new_videos + cached_videos if not force_rescan else new_videos
+        
         if new_videos or force_rescan:
-            with open(cache_file, 'w', encoding='utf-8') as f: json.dump(final_list, f, ensure_ascii=False, indent=2)
+            with open(cache_file, 'w', encoding='utf-8') as f: 
+                json.dump(final_list, f, ensure_ascii=False, indent=2)
+            
+            # [추가] 깃허브 클라우드 저장 (영구 저장)
+            upload_to_github(cache_file, final_list)
+            
             status_box.success(f"✅ **[{ch_name}]** 완료 (+{len(new_videos)})")
         else: status_box.success(f"✅ **[{ch_name}]** 최신")
         return {'creds': creds, 'name': ch_name, 'videos': final_list}
@@ -542,19 +674,18 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     norm_keyword = normalize_text(keyword)
     target_ids = []
     id_map = {} 
-    video_date_map = {} # 영상별 업로드 날짜 저장용
+    video_date_map = {}
     
-    # 1. 대상 영상 필터링
     for v in videos:
         t_match = norm_keyword in normalize_text(v['title'])
         d_match = norm_keyword in normalize_text(v.get('description', ''))
         if not (t_match or d_match): continue
         
-        v_dt_kst = parse_utc_to_kst_date(v['date']) # KST Date 객체
+        v_dt_kst = parse_utc_to_kst_date(v['date'])
         if v_dt_kst and (vid_start <= v_dt_kst <= vid_end): 
             target_ids.append(v['id'])
             id_map[v['id']] = v['title']
-            video_date_map[v['id']] = v['date'] # UTC 문자열 그대로 저장 ("2025-01-01T00:00:00Z")
+            video_date_map[v['id']] = v['date']
             
     if not target_ids: return None
     
@@ -570,7 +701,6 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     
     top_video_stats = []
     
-    # 48시간 기준점 설정 (UTC 기준)
     now_utc = datetime.utcnow()
     threshold_dt = now_utc - timedelta(hours=48)
     
@@ -579,41 +709,31 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         batch_ids = target_ids[i : i + batch_size]
         vid_str = ",".join(batch_ids)
         
-        # [A] Analytics 데이터 수집
-        # 배치 전체 합산 데이터 (공유, 인구통계 등 개별 매핑 어려운 것들)
-        anl_views_map = {} # 영상별 Analytics 조회수 저장
-        anl_likes_map = {} # 영상별 Analytics 좋아요 저장
-        anl_retention_map = {} # 영상별 지속률 저장
+        anl_views_map = {}
+        anl_likes_map = {}
+        anl_retention_map = {}
         
         try:
-            # 1. 전체 합산용 (공유 등)
             r_b = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
             if 'rows' in r_b and r_b['rows']:
-                total_shares += r_b['rows'][0][0] # 공유는 Data API에 없으므로 Analytics 전적으로 신뢰
+                total_shares += r_b['rows'][0][0]
 
-            # 2. 영상별 상세 데이터 (조회수, 좋아요, 지속률) -> 48시간 로직 적용을 위해 'dimensions=video'로 쪼개서 받음
             r_v = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
             if 'rows' in r_v and r_v['rows']:
                 for r in r_v['rows']:
-                    # r[0]: video_id, r[1]: views, r[2]: likes, r[3]: avg_pct
                     anl_views_map[r[0]] = r[1]
                     anl_likes_map[r[0]] = r[2]
                     anl_retention_map[r[0]] = r[3]
 
-            # 3. 기타 차트용 데이터 (이건 합산치 그대로 사용)
-            # 인구통계
             r_d = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='viewerPercentage', dimensions='ageGroup,gender', filters=f'video=={vid_str}').execute()
-            # 배치 전체 뷰수 구하기 (가중치 계산용)
             batch_total_view_anl = sum(anl_views_map.values())
             if 'rows' in r_d and r_d['rows']:
                 for r in r_d['rows']: demo[f"{r[0]}_{r[1]}"] += batch_total_view_anl * (r[2] / 100)
 
-            # 유입경로
             r_t = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceType', filters=f'video=={vid_str}').execute()
             if 'rows' in r_t and r_t['rows']:
                 for r in r_t['rows']: traffic[r[0]] += r[1]
             
-            # 검색어 (Top 15)
             try:
                 r_k = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceDetail', filters=f'video=={vid_str};insightTrafficSourceType==YT_SEARCH', maxResults=15, sort='-views').execute()
                 if 'rows' in r_k and r_k['rows']:
@@ -621,19 +741,16 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                         if r[0] != 'GOOGLE_SEARCH': keywords_count[r[0]] += r[1]
             except: pass
 
-            # 국가
             r_c = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='country', filters=f'video=={vid_str}', maxResults=50).execute()
             if 'rows' in r_c and r_c['rows']:
                 for r in r_c['rows']: country[r[0]] += r[1]
 
-            # 일별 추이
             r_day = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
             if 'rows' in r_day and r_day['rows']:
                 for r in r_day['rows']: daily[r[0]] += r[1]
         
         except: pass
 
-        # [B] Data API (실시간) 데이터 수집 및 [C] 하이브리드 합산
         try:
             rt_res = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
             
@@ -644,61 +761,47 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                     rt_stats_map[item['id']] = item['statistics']
                     rt_content_map[item['id']] = item['contentDetails']
 
-            # === [핵심 로직] 영상별 날짜 비교하여 합산 ===
             for vid_id in batch_ids:
-                # 1. 영상 날짜 확인
                 v_date_str = video_date_map.get(vid_id)
                 if not v_date_str: continue
                 
                 v_upload_dt = datetime.strptime(v_date_str, "%Y-%m-%dT%H:%M:%SZ")
-                is_recent = v_upload_dt > threshold_dt # 48시간 이내 업로드 여부
+                is_recent = v_upload_dt > threshold_dt
 
-                # 2. 데이터 가져오기
-                # Analytics 데이터
                 a_v = anl_views_map.get(vid_id, 0)
                 a_l = anl_likes_map.get(vid_id, 0)
                 a_pct = anl_retention_map.get(vid_id, 0)
                 
-                # Data API 데이터 (실시간)
                 stats = rt_stats_map.get(vid_id, {})
                 rt_v = int(stats.get('viewCount', 0))
                 rt_l = int(stats.get('likeCount', 0))
                 
-                # 3. 결정 로직 (User Request)
                 final_v = 0
                 final_l = 0
                 
                 if is_recent:
-                    # [Case 1] 최신 영상 (<48h) -> Data API (실시간 누적값) 채택
                     final_v = rt_v
                     final_l = rt_l
                 else:
-                    # [Case 2] 오래된 영상 (>48h) -> Analytics API (기간 내 데이터) 채택
                     final_v = a_v
                     final_l = a_l
                 
-                # 4. 총계 합산
                 total_views += final_v
                 total_likes += final_l
                 
-                # 가중 평균 (지속률은 Analytics에만 있음. 최신 영상은 지속률 0일 확률 높음)
                 if final_v > 0 and a_pct > 0:
                     w_avg_sum += (final_v * a_pct)
                     v_for_avg += final_v
                 
-                # 100만 카운트 (이건 항상 실시간 기준이 정확함 - 명예의 전당 느낌)
                 if rt_v >= 1000000: over_1m_count += 1
 
-                # 5. Top 리스트용 데이터 (리스트에는 항상 '현재 상태'를 보여주는게 좋음 -> Data API 사용)
-                # 단, '기간 내 조회수'를 보여주고 싶다면 final_v를 써야 함.
-                # 보통 리스트는 "이 영상의 현재 스펙"을 보는 용도이므로 rt_v(실시간) 유지
                 if rt_v > 0:
                     top_video_stats.append({
                         'id': vid_id,
                         'title': id_map.get(vid_id, 'Unknown'),
-                        'views': rt_v,       # 리스트 표시용: 실시간 조회수
-                        'likes': rt_l,       # 리스트 표시용: 실시간 좋아요
-                        'period_views': final_v, # (옵션) 기간 내 조회수
+                        'views': rt_v,
+                        'likes': rt_l,
+                        'period_views': final_v,
                         'avg_pct': a_pct if a_pct > 0 else None,
                         'duration_min': parse_duration_to_minutes(rt_content_map.get(vid_id, {}).get('duration'))
                     })
@@ -727,8 +830,6 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
 
 
 # region [5. 메인 UI 및 실행 로직 (Main UI & Execution)]
-# ==========================================
-# 사이드바, 메인 대시보드 UI, 실행 컨트롤
 # ==========================================
 st.title("📊 Drama YouTube Insight")
 
@@ -841,7 +942,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
             
             prog_bar = st.progress(0, text="데이터 분석 중...")
             
-            # 여기서 계산은 일단 채널별로 다 수행해서 list에 담음
             ch_details_results = []
             
             ctx = get_script_run_ctx()
@@ -860,11 +960,9 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
             prog_bar.empty()
             
-            # 원본 데이터 세션 저장
             st.session_state['analysis_raw_results'] = ch_details_results
             st.session_state['analysis_keyword'] = keyword
 
-    # --- 결과 렌더링 세션 (여기서 집계 및 선택 필터링 수행) ---
     if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw_results']:
         raw_data = st.session_state['analysis_raw_results']
         current_kw = st.session_state['analysis_keyword']
@@ -872,7 +970,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
         st.divider()
         st.markdown(f"### 📊 분석 리포트: <span style='color:#2980b9;'>{current_kw}</span>", unsafe_allow_html=True)
         
-        # [2. 수정] 채널 선택기 (작게 상단 배치)
         ch_names = sorted([d['channel_name'] for d in raw_data])
         sel_options = ["전체 채널 합산"] + ch_names
         
@@ -880,13 +977,11 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
         with c_sel_col:
             selected_ch = st.selectbox("분석 대상 채널 선택", sel_options, label_visibility="collapsed")
         
-        # --- 선택에 따른 실시간 집계 (Aggregation) ---
         if selected_ch == "전체 채널 합산":
             target_data = raw_data
         else:
             target_data = [d for d in raw_data if d['channel_name'] == selected_ch]
             
-        # 집계 변수 초기화
         final_views = 0; final_likes = 0; final_shares = 0
         final_over_1m = 0; final_vid_count = 0
         final_stats = defaultdict(float); final_traffic = defaultdict(float)
@@ -902,7 +997,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
             final_over_1m += d['over_1m_count']
             final_vid_count += d['video_count']
             
-            # 평균 지속률 가중치용
             if d['avg_view_pct'] > 0 and d['total_views'] > 0:
                 w_avg_sum += (d['avg_view_pct'] * d['total_views'])
                 v_for_avg += d['total_views']
@@ -916,18 +1010,15 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
             
         final_avg_pct = (w_avg_sum / v_for_avg) if v_for_avg > 0 else 0
         
-        # [3. 수정] 일별 추이용 Gap 계산 (Hybrid Total - Analytics Sum)
         anl_total_daily = sum(final_daily.values())
         recent_gap = final_views - anl_total_daily
         
-        # --- UI 그리기 ---
         safe_anl_date = datetime.now() - timedelta(days=3)
         safe_str = safe_anl_date.strftime("%Y-%m-%d")
         
         if final_views > 0 or len(final_top_videos) > 0:
             st.caption(f"ℹ️ **데이터 기준**: 인구통계/경로 등은 **~{safe_str}** 확정치, **총 조회수/좋아요 및 리스트**는 **실시간(Realtime)** 데이터입니다.")
 
-            # [섹션 0] 핵심 지표
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("총 조회수", f"{int(final_views):,}")
             m2.metric("분석 영상", f"{final_vid_count:,}개")
@@ -937,7 +1028,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
             m6.metric("총 공유", f"{int(final_shares):,}")
             st.write("")
 
-            # [섹션 1] 성별/연령 (있을 때만)
             fig_demo, df_table, _ = get_pyramid_chart_and_df(final_stats, final_views)
             if fig_demo:
                 c1, c2 = st.columns([1.6, 1])
@@ -955,8 +1045,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                             st.dataframe(df_disp, use_container_width=True, hide_index=True, height=300)
                 st.write("")
 
-            # [1. 수정] 일별 조회수 추이 (전체 1행)
-            # Analytics 데이터가 없어도 Gap(Data API)이 있으면 차트를 그리기 위해 조건 완화
             fig_trend = get_daily_trend_chart(final_daily, recent_gap)
             if fig_trend:
                 st.markdown("##### 📈 일별 조회수 추이 (Analytics + Realtime Gap)")
@@ -964,7 +1052,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                     st.plotly_chart(fig_trend, use_container_width=True)
                 st.write("")
 
-            # [1. 수정] 인기 영상 리스트 (전체 1행)
             st.markdown("##### 🥇 인기 영상 TOP 100 (실시간 기준)")
             with st.container(border=True):
                 if final_top_videos:
@@ -990,11 +1077,9 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 else: st.caption("데이터가 없습니다.")
             st.write("")
 
-            # [섹션 2] 유입/검색어
             fig_traffic = get_traffic_chart(final_traffic)
             fig_keywords = get_keyword_bar_chart(final_keywords)
             
-            # [4. 수정] 둘 중 하나라도 있어야 행 생성
             if fig_traffic or fig_keywords:
                 r2_1, r2_2 = st.columns(2)
                 with r2_1:
@@ -1009,14 +1094,8 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                             st.plotly_chart(fig_keywords, use_container_width=True)
                 st.write("")
             
-            # [섹션 3] 점유율/반응
-            # 점유율은 '전체' 보기일 때만 의미가 있으므로, '전체 채널 합산'일 때만 표시하거나,
-            # 특정 채널 선택 시 전체 대비 점유율을 보여주는 로직 필요.
-            # 여기서는 편의상 점유율 차트는 전체 보기 모드에서만, 반응 차트는 항상 표시
-            
             show_share = (selected_ch == "전체 채널 합산") and (len(raw_data) > 1)
             fig_share = get_channel_share_chart(raw_data, highlight_channel=None) if show_share else None
-            # 특정 채널 선택시엔 그 채널을 하이라이트해서 보여줄 수도 있음
             if selected_ch != "전체 채널 합산" and len(raw_data) > 1:
                 fig_share = get_channel_share_chart(raw_data, highlight_channel=selected_ch)
             
@@ -1036,7 +1115,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                             st.plotly_chart(fig_engage, use_container_width=True)
                 st.write("")
 
-            # [섹션 4] 지도
             fig_map = get_country_map(final_country)
             if fig_map:
                 st.markdown("##### 🌍 글로벌 조회수 분포")
@@ -1044,7 +1122,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                     st.plotly_chart(fig_map, use_container_width=True)
                 st.write("")
 
-            # [섹션 5] 효율성 (Scatter)
             if final_top_videos:
                 valid_scatter_vids = [v for v in final_top_videos if v.get('avg_pct') is not None and v.get('avg_pct') > 0]
                 fig_scatter = get_efficiency_scatter(valid_scatter_vids)
