@@ -776,7 +776,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         anl_retention_map = {}
         
         try:
-            # 1. 기간 내 기본 조회수 (Batch)
+            # 1. 기간 내 기본 조회수 (Batch) - Analytics 기준
             r_v = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
             if 'rows' in r_v and r_v['rows']:
                 for r in r_v['rows']:
@@ -784,7 +784,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                     anl_likes_map[r[0]] = r[2]
                     anl_retention_map[r[0]] = r[3]
             
-            # 2. 기타 통계 (공유, 데모, 트래픽 등) - 이건 Analytics 의존 (실시간 불가 영역)
+            # 2. 기타 통계 (공유, 데모, 트래픽 등) - Analytics 의존
             r_b = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
             if 'rows' in r_b and r_b['rows']: total_shares += r_b['rows'][0][0]
 
@@ -838,35 +838,36 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 a_pct = anl_retention_map.get(vid_id, 0)
                 
                 stats = rt_stats_map.get(vid_id, {})
-                rt_v = int(stats.get('viewCount', 0)) # Data API 평생 조회수
+                rt_v = int(stats.get('viewCount', 0)) # Data API 평생 조회수 (Realtime Total)
                 rt_l = int(stats.get('likeCount', 0))
                 
                 final_v = 0
                 final_l = 0
                 
                 # ==========================================================
-                # 🔥 [수정] 호범's 천재적 뺄셈 로직 적용 (Accuracy Mode)
+                # 🔥 [수정] 호범's 천재적 뺄셈 로직 적용 (하이브리드 모드)
                 # ==========================================================
                 if use_hybrid_logic:
-                    # Case 1: 영상이 분석 시작일 이후에 올라옴 (완전 최신)
+                    # Case 1: 영상 업로드일이 분석 시작일보다 같거나 늦음 (완전 최신 영상)
+                    # -> 뺄셈 불필요, 평생 조회수가 곧 기간 내 조회수
                     if v_upload_dt >= anl_start_date:
-                        # 평생 조회수 = 기간 내 조회수 (뺄 게 없음)
                         final_v = rt_v
                         final_l = rt_l
                     
-                    # Case 2 (3-b): 영상은 옛날 건데, 최신 성과를 보고 싶음 (역주행 고려)
+                    # Case 2: 영상은 옛날에 올라왔지만, 최신 성과를 보고 싶음 (역주행/스테디셀러)
+                    # -> [실시간 Total] - [분석 시작일 전날까지의 과거 누적치] = [이번 구간 조회수]
                     else:
-                        # "실시간 Total" - "분석 시작일 전날까지의 과거 누적치"
                         deduct_end_date = anl_start_date - timedelta(days=1)
                         deduct_start_str = v_upload_dt.strftime("%Y-%m-%d")
                         deduct_end_str = deduct_end_date.strftime("%Y-%m-%d")
                         
                         past_views = 0
                         past_likes = 0
+                        is_past_data_fetched = False
                         
-                        # 과거 데이터 조회를 위해 API 추가 호출 (정확도를 위한 투자)
+                        # 과거 데이터 조회를 위해 Analytics API 추가 호출
                         try:
-                            # 쿼리 최적화: 날짜가 꼬이지 않았는지 확인
+                            # 쿼리 최적화: 날짜가 꼬이지 않았는지 확인 (시작일 <= 종료일)
                             if v_upload_dt <= deduct_end_date:
                                 r_past = yt_anl.reports().query(
                                     ids='channel==MINE', 
@@ -875,36 +876,51 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                                     metrics='views,likes', 
                                     filters=f'video=={vid_id}'
                                 ).execute()
+                                
                                 if 'rows' in r_past and r_past['rows']:
                                     past_views = r_past['rows'][0][0]
                                     past_likes = r_past['rows'][0][1]
-                        except:
-                            # 에러나면 차선책: 그냥 Analytics 기간 조회수 사용하거나 0 처리
-                            past_views = 0 # 뺄셈 실패 시 안전하게 보수적 접근 (혹은 a_v 사용)
+                                    is_past_data_fetched = True
+                                else:
+                                    # 데이터가 없으면 0으로 간주 (단, API 누락 가능성 존재 - 사용자 리스크 감수)
+                                    past_views = 0
+                                    past_likes = 0
+                                    is_past_data_fetched = True
+                        except Exception as e:
+                            # API 에러 시에는 뺄셈 불가
+                            is_past_data_fetched = False
 
-                        # 계산: (현재 Total) - (과거 누적) = (최근 기간 조회수)
-                        # 음수 방지 (가끔 싱크 문제로 꼬일 때 대비)
-                        final_v = max(0, rt_v - past_views)
-                        final_l = max(0, rt_l - past_likes)
+                        # 계산 수행
+                        if is_past_data_fetched:
+                            # 음수 방지 (데이터 싱크 차이로 뺄셈이 음수가 될 경우 0 처리)
+                            final_v = max(0, rt_v - past_views)
+                            final_l = max(0, rt_l - past_likes)
+                        else:
+                            # 과거 데이터를 못 가져왔다면 Analytics(a_v) 값 사용 (Total 사용 시 과대계상 방지)
+                            final_v = a_v
+                            final_l = a_l
 
-                        # 안전장치: 계산값이 0이거나 이상하면 기존 Analytics 값(a_v)과 비교해서 큰 거 사용
-                        # 이유: 과거 API가 실패해서 past_views가 0이면 final_v가 rt_v(Total)이 되어버림 (과대계상)
-                        # 따라서 past_views를 못 구했으면 a_v(Analytics)로 회귀하는 게 안전함
-                        if past_views == 0 and a_v > 0 and final_v == rt_v:
+                        # [안전장치] 
+                        # 뺄셈 결과(final_v)가 Total(rt_v)과 똑같고, a_v(Analytics)는 값이 존재하는데 past_views가 0이라면?
+                        # -> 과거 데이터 조회가 '누락'된 케이스일 확률이 높음.
+                        # -> 이 경우 과대계상을 막기 위해 Analytics 값(a_v)으로 회귀
+                        if final_v == rt_v and a_v > 0 and past_views == 0:
                              final_v = a_v
                              final_l = a_l
 
                 else:
-                    # [Case B] 완전히 과거 기간 조회 -> Analytics API 신뢰
+                    # [Case B] 완전히 과거 기간 조회 -> Analytics API 신뢰 (실시간성 불필요)
                     final_v = a_v
                     final_l = a_l
 
-                # [최종 안전장치]
+                # [최종 데이터 보정]
+                # Analytics도 0이고 계산도 0인데, 실제 영상은 조회수가 있다(rt_v > 0)?
+                # 하이브리드 모드라면 '0'보다는 'Total'이라도 보여주는 게 낫다고 판단 (누락 방지)
                 if final_v == 0 and rt_v > 0 and use_hybrid_logic:
-                    # 뭔가 0인데 실시간은 살아있다? -> 누락 방지를 위해 Total이라도 보여줌 (0보단 나음)
                     final_v = rt_v
                     final_l = rt_l
                 
+                # --- 집계 ---
                 total_views += final_v
                 total_likes += final_l
                 
@@ -914,26 +930,30 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 
                 if rt_v >= 1000000: over_1m_count += 1
 
-                if rt_v > 0:
+                # [리스트 저장]
+                # period_views / period_likes에 계산된 하이브리드 값 저장
+                if final_v > 0:
                     top_video_stats.append({
                         'id': vid_id,
                         'title': id_map.get(vid_id, 'Unknown'),
-                        'views': rt_v, # 리스트에는 항상 Total 조회수 표시 (참고용)
-                        'likes': rt_l,
-                        'period_views': final_v, # 여기가 분석 기간 조회수
+                        'views': rt_v,           # (참고용) 전체 누적 조회수
+                        'likes': rt_l,           # (참고용) 전체 누적 좋아요
+                        'period_views': final_v, # ✅ [핵심] 기간 내 조회수 (Hybrid)
+                        'period_likes': final_l, # ✅ [핵심] 기간 내 좋아요 (Hybrid)
                         'avg_pct': a_pct if a_pct > 0 else None,
                         'duration_min': parse_duration_to_minutes(rt_content_map.get(vid_id, {}).get('duration'))
                     })
 
         except Exception as e:
-            print(f"Error processing batch: {e}")
+            # print(f"Error processing batch: {e}") 
             pass
 
         time.sleep(0.05)
 
     if not top_video_stats and total_views == 0: return None
     
-    top_video_stats.sort(key=lambda x: x['views'], reverse=True)
+    # [수정] 정렬 기준을 '기간 내 조회수'로 변경
+    top_video_stats.sort(key=lambda x: x['period_views'], reverse=True)
 
     return {
         'channel_name': channel_data['name'], 'video_count': len(target_ids),
@@ -1171,17 +1191,26 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                     st.plotly_chart(fig_trend, use_container_width=True)
                 st.write("")
 
-            st.markdown("##### 🥇 인기 영상 TOP 100 (실시간 기준)")
+            # [이전 코드는 동일]
+            st.markdown("##### 🥇 인기 영상 TOP 100 (기간 내 성과 기준)")
             with st.container(border=True):
                 if final_top_videos:
                     unique_vids_map = {v['id']: v for v in final_top_videos}
                     deduped_vids = list(unique_vids_map.values())
-                    top_vids = sorted(deduped_vids, key=lambda x: x['views'], reverse=True)[:100]
+                    
+                    # [수정] 정렬 기준: period_views (기간 조회수)
+                    top_vids = sorted(deduped_vids, key=lambda x: x['period_views'], reverse=True)[:100]
                     
                     df_top = pd.DataFrame(top_vids)
                     df_top['link'] = df_top['id'].apply(lambda x: f"https://youtu.be/{x}")
-                    df_show = df_top[['title', 'views', 'avg_pct', 'likes', 'link']].copy()
+                    
+                    # [수정] 보여줄 컬럼: period_views, period_likes 사용
+                    df_show = df_top[['title', 'period_views', 'avg_pct', 'period_likes', 'link']].copy()
+                    
+                    # [수정] 컬럼명 매핑
                     df_show.columns = ['제목', '조회수', '지속률(%)', '좋아요', '바로가기']
+                    
+                    # 숫자 포맷팅
                     df_show['조회수'] = df_show['조회수'].apply(lambda x: f"{int(x):,}")
                     df_show['좋아요'] = df_show['좋아요'].apply(lambda x: f"{int(x):,}")
                     
