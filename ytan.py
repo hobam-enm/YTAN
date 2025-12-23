@@ -243,12 +243,18 @@ def parse_duration_to_minutes(duration_str):
     total_sec = (int(h or 0) * 3600) + (int(m or 0) * 60) + (int(s or 0))
     return round(total_sec / 60, 1)
 
-# [수정] Github 업로드 함수 (성공/실패 여부와 메시지를 반환하도록 변경)
+# [수정] Github 업로드 함수 (한글 자모 분리 및 특수문자 완벽 대응)
 def upload_to_github(file_path, content_list):
     """
-    로컬에서 생성된 캐시 데이터를 GitHub 리포지토리에 영구 저장(Commit & Push)합니다.
-    Returns: (성공여부 Bool, 메시지 String)
+    로컬 캐시 데이터를 GitHub에 저장합니다.
+    한글 파일명 비교 시 발생하는 NFC/NFD(자모 분리) 문제를 해결했습니다.
     """
+    import unicodedata # 한글 정규화를 위한 라이브러리
+
+    def normalize_str(s):
+        # 문자열을 NFC(표준 통합형)로 강제 변환하여 비교
+        return unicodedata.normalize('NFC', s) if s else ""
+
     try:
         if "github" not in st.secrets: 
             return False, "설정 오류: secrets.toml에 [github] 섹션이 없습니다."
@@ -257,27 +263,40 @@ def upload_to_github(file_path, content_list):
         gh_repo = st.secrets["github"]["repo_name"]
         gh_branch = st.secrets["github"]["branch"]
 
-        # 깃허브 연결
         g = Github(gh_token)
         repo = g.get_repo(gh_repo)
         
-        # 데이터 직렬화
         json_content = json.dumps(content_list, ensure_ascii=False, indent=2)
         commit_message = f"Update cache: {file_path} (via Streamlit App)"
         
-        try:
-            # 파일이 이미 있으면 수정(Update) 시도
-            contents = repo.get_contents(file_path, ref=gh_branch)
-            repo.update_file(contents.path, commit_message, json_content, contents.sha, branch=gh_branch)
-        except GithubException:
-            # 파일이 없으면 생성(Create) 시도
+        # 1. 저장소의 모든 파일 목록 가져오기 (루트 경로)
+        contents = repo.get_contents("", ref=gh_branch)
+        
+        target_sha = None
+        target_path_on_git = file_path # 기본값은 로컬 파일명
+        
+        # 2. 정규화된 이름으로 파일 찾기 (여기가 핵심!)
+        search_name = normalize_str(file_path)
+        
+        for c in contents:
+            # 깃허브에 있는 파일명도 정규화해서 비교
+            if normalize_str(c.path) == search_name:
+                target_sha = c.sha
+                target_path_on_git = c.path # 깃허브에 저장된 실제 경로 사용
+                break
+        
+        # 3. 찾았으면 Update, 없으면 Create
+        if target_sha:
+            repo.update_file(target_path_on_git, commit_message, json_content, target_sha, branch=gh_branch)
+            return True, "Updated (SHA Found)"
+        else:
             repo.create_file(file_path, commit_message, json_content, branch=gh_branch)
-            
-        # 성공 시 True 반환
-        return True, "OK"
+            return True, "Created (New File)"
 
     except Exception as e:
-        # 실패 시 False와 에러 메시지 반환
+        # 422 에러가 떴다는 건, 위 로직에도 불구하고 파일이 존재한다고 깃허브가 판단한 경우임
+        if "422" in str(e):
+            return False, f"⚠️ 파일명 충돌 발생 (422): 깃허브에 파일이 있지만 파이썬이 찾지 못했습니다. 파일명을 영어로 변경하는 것을 권장합니다.\n({e})"
         return False, str(e)
 # endregion
 
