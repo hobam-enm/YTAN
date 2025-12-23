@@ -243,7 +243,6 @@ def parse_duration_to_minutes(duration_str):
     total_sec = (int(h or 0) * 3600) + (int(m or 0) * 60) + (int(s or 0))
     return round(total_sec / 60, 1)
 
-# [Github 자동 업로드 함수]
 # [수정] Github 업로드 함수 (성공/실패 여부와 메시지를 반환하도록 변경)
 def upload_to_github(file_path, content_list):
     """
@@ -281,7 +280,6 @@ def upload_to_github(file_path, content_list):
         # 실패 시 False와 에러 메시지 반환
         return False, str(e)
 # endregion
-
 
 # region [3. 시각화 함수 (Visualization)]
 # ==========================================
@@ -658,7 +656,6 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         ch_info = ch_res['items'][0]; ch_name = ch_info['snippet']['title']
         uploads_id = ch_info['contentDetails']['relatedPlaylists']['uploads']
         
-        # [수정] 파일명 규칙 변경 (nov 제거)
         cache_file = f"cache_{token_file}"
         
         cached_videos = []
@@ -669,7 +666,6 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             cached_ids = {v['id'] for v in cached_videos}
             status_box.info(f"🔄 [{ch_name}] 확인 중...")
         else: 
-            # 재수집 시에도 기존 파일이 있으면 일단 읽어둠 (과거 데이터 보존용)
             if os.path.exists(cache_file):
                 with open(cache_file, 'r', encoding='utf-8') as f: cached_videos = json.load(f)
             status_box.info(f"⏳ [{ch_name}] 스캔 시작")
@@ -685,7 +681,6 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
                 desc = item['snippet']['description']
                 p_at = item['snippet']['publishedAt']
                 
-                # 마지노선 날짜보다 옛날 영상이면 수집 중단
                 if p_at < limit_date: stop_scanning = True; break
                 
                 if not force_rescan and vid in cached_ids: 
@@ -698,9 +693,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             next_page_token = res.get('nextPageToken')
             if not next_page_token: stop_scanning = True
         
-        # [수정] 데이터 병합 로직 개선 (과거 데이터 보존)
         if force_rescan:
-            # 전체 재수집(force_rescan)이라도, 수집 범위(limit_date)보다 더 옛날 데이터는 캐시에서 살려둬야 함
             preserved_videos = [v for v in cached_videos if v['date'] < limit_date]
             final_list = new_videos + preserved_videos
         else:
@@ -710,24 +703,30 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             with open(cache_file, 'w', encoding='utf-8') as f: 
                 json.dump(final_list, f, ensure_ascii=False, indent=2)
             
-            # 깃허브 클라우드 저장 (영구 저장)
-            upload_to_github(cache_file, final_list)
+            # [수정] 업로드 결과를 받아서 실패 시 화면에 띄우기!
+            is_ok, error_msg = upload_to_github(cache_file, final_list)
             
-            status_box.success(f"✅ **[{ch_name}]** 완료 (+{len(new_videos)})")
-        else: status_box.success(f"✅ **[{ch_name}]** 최신")
+            if is_ok:
+                status_box.success(f"✅ **[{ch_name}]** 깃허브 저장 완료 (+{len(new_videos)})")
+            else:
+                status_box.error(f"⚠️ **[{ch_name}]** 로컬만 저장됨 / 깃허브 실패:\n{error_msg}")
+        else: 
+            status_box.success(f"✅ **[{ch_name}]** 최신")
+        
         return {'creds': creds, 'name': ch_name, 'videos': final_list}
     except Exception as e:
         status_box.error(f"❌ 에러: {str(e)}")
         return {'error': str(e)}
 
 def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_start, anl_end):
+    # (기존 로직과 동일 - 생략 없이 그대로 유지)
     creds = channel_data['creds']; videos = channel_data['videos']
     norm_keyword = normalize_text(keyword)
     target_ids = []
     id_map = {} 
     video_date_map = {}
     
-    # 1. 영상 필터링 (업로드 기간 기준)
+    # 1. 영상 필터링
     for v in videos:
         t_match = norm_keyword in normalize_text(v['title'])
         d_match = norm_keyword in normalize_text(v.get('description', ''))
@@ -753,7 +752,6 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     
     top_video_stats = []
     
-    # 날짜 객체 변환 및 하이브리드 모드 판단
     today_date = datetime.now().date()
     
     if isinstance(anl_end, str):
@@ -766,7 +764,6 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     else:
         anl_start_date = anl_start
         
-    # [핵심 기준] 분석 종료일이 '그제(D-2)' 이후라면 하이브리드 모드(Data API 사용) 진입
     use_hybrid_logic = anl_end_date >= (today_date - timedelta(days=2))
     
     batch_size = 50 
@@ -774,21 +771,14 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         batch_ids = target_ids[i : i + batch_size]
         vid_str = ",".join(batch_ids)
         
-        # --- Batch Analytics (공통 지표) ---
-        anl_views_map = {}
-        anl_likes_map = {}
-        anl_retention_map = {}
+        anl_views_map = {}; anl_likes_map = {}; anl_retention_map = {}
         
         try:
-            # 1. 기간 내 기본 조회수 (Batch) - Analytics 기준
             r_v = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
             if 'rows' in r_v and r_v['rows']:
                 for r in r_v['rows']:
-                    anl_views_map[r[0]] = r[1]
-                    anl_likes_map[r[0]] = r[2]
-                    anl_retention_map[r[0]] = r[3]
+                    anl_views_map[r[0]] = r[1]; anl_likes_map[r[0]] = r[2]; anl_retention_map[r[0]] = r[3]
             
-            # 2. 기타 통계 (공유, 데모, 트래픽 등) - Analytics 의존
             r_b = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
             if 'rows' in r_b and r_b['rows']: total_shares += r_b['rows'][0][0]
 
@@ -815,15 +805,11 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
             r_day = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
             if 'rows' in r_day and r_day['rows']:
                 for r in r_day['rows']: daily[r[0]] += r[1]
-
         except: pass
 
-        # --- Data API (Realtime) & Calculation ---
         try:
             rt_res = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
-            
-            rt_stats_map = {}
-            rt_content_map = {}
+            rt_stats_map = {}; rt_content_map = {}
             if 'items' in rt_res:
                 for item in rt_res['items']:
                     rt_stats_map[item['id']] = item['statistics']
@@ -832,101 +818,54 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
             for vid_id in batch_ids:
                 v_date_str = video_date_map.get(vid_id)
                 if not v_date_str: continue
-                
                 v_upload_dt = parse_utc_to_kst_date(v_date_str)
                 if isinstance(v_upload_dt, datetime): v_upload_dt = v_upload_dt.date()
 
-                # 1. 기본값 준비
-                a_v = anl_views_map.get(vid_id, 0) # Analytics 기간 조회수
+                a_v = anl_views_map.get(vid_id, 0)
                 a_l = anl_likes_map.get(vid_id, 0)
                 a_pct = anl_retention_map.get(vid_id, 0)
                 
                 stats = rt_stats_map.get(vid_id, {})
-                rt_v = int(stats.get('viewCount', 0)) # Data API 평생 조회수 (Realtime Total)
+                rt_v = int(stats.get('viewCount', 0))
                 rt_l = int(stats.get('likeCount', 0))
                 
-                final_v = 0
-                final_l = 0
+                final_v = 0; final_l = 0
                 
-                # ==========================================================
-                # 🔥 [수정] 호범's 천재적 뺄셈 로직 적용 (하이브리드 모드)
-                # ==========================================================
                 if use_hybrid_logic:
-                    # Case 1: 영상 업로드일이 분석 시작일보다 같거나 늦음 (완전 최신 영상)
-                    # -> 뺄셈 불필요, 평생 조회수가 곧 기간 내 조회수
                     if v_upload_dt >= anl_start_date:
-                        final_v = rt_v
-                        final_l = rt_l
-                    
-                    # Case 2: 영상은 옛날에 올라왔지만, 최신 성과를 보고 싶음 (역주행/스테디셀러)
-                    # -> [실시간 Total] - [분석 시작일 전날까지의 과거 누적치] = [이번 구간 조회수]
+                        final_v = rt_v; final_l = rt_l
                     else:
                         deduct_end_date = anl_start_date - timedelta(days=1)
                         deduct_start_str = v_upload_dt.strftime("%Y-%m-%d")
                         deduct_end_str = deduct_end_date.strftime("%Y-%m-%d")
                         
-                        past_views = 0
-                        past_likes = 0
-                        is_past_data_fetched = False
-                        
-                        # 과거 데이터 조회를 위해 Analytics API 추가 호출
+                        past_views = 0; past_likes = 0; is_past_data_fetched = False
                         try:
-                            # 쿼리 최적화: 날짜가 꼬이지 않았는지 확인 (시작일 <= 종료일)
                             if v_upload_dt <= deduct_end_date:
-                                r_past = yt_anl.reports().query(
-                                    ids='channel==MINE', 
-                                    startDate=deduct_start_str, 
-                                    endDate=deduct_end_str, 
-                                    metrics='views,likes', 
-                                    filters=f'video=={vid_id}'
-                                ).execute()
-                                
+                                r_past = yt_anl.reports().query(ids='channel==MINE', startDate=deduct_start_str, endDate=deduct_end_str, metrics='views,likes', filters=f'video=={vid_id}').execute()
                                 if 'rows' in r_past and r_past['rows']:
                                     past_views = r_past['rows'][0][0]
                                     past_likes = r_past['rows'][0][1]
                                     is_past_data_fetched = True
                                 else:
-                                    # 데이터가 없으면 0으로 간주 (단, API 누락 가능성 존재 - 사용자 리스크 감수)
-                                    past_views = 0
-                                    past_likes = 0
-                                    is_past_data_fetched = True
-                        except Exception as e:
-                            # API 에러 시에는 뺄셈 불가
-                            is_past_data_fetched = False
+                                    past_views = 0; past_likes = 0; is_past_data_fetched = True
+                        except: is_past_data_fetched = False
 
-                        # 계산 수행
                         if is_past_data_fetched:
-                            # 음수 방지 (데이터 싱크 차이로 뺄셈이 음수가 될 경우 0 처리)
                             final_v = max(0, rt_v - past_views)
                             final_l = max(0, rt_l - past_likes)
                         else:
-                            # 과거 데이터를 못 가져왔다면 Analytics(a_v) 값 사용 (Total 사용 시 과대계상 방지)
-                            final_v = a_v
-                            final_l = a_l
+                            final_v = a_v; final_l = a_l
 
-                        # [안전장치] 
-                        # 뺄셈 결과(final_v)가 Total(rt_v)과 똑같고, a_v(Analytics)는 값이 존재하는데 past_views가 0이라면?
-                        # -> 과거 데이터 조회가 '누락'된 케이스일 확률이 높음.
-                        # -> 이 경우 과대계상을 막기 위해 Analytics 값(a_v)으로 회귀
                         if final_v == rt_v and a_v > 0 and past_views == 0:
-                             final_v = a_v
-                             final_l = a_l
-
+                             final_v = a_v; final_l = a_l
                 else:
-                    # [Case B] 완전히 과거 기간 조회 -> Analytics API 신뢰 (실시간성 불필요)
-                    final_v = a_v
-                    final_l = a_l
+                    final_v = a_v; final_l = a_l
 
-                # [최종 데이터 보정]
-                # Analytics도 0이고 계산도 0인데, 실제 영상은 조회수가 있다(rt_v > 0)?
-                # 하이브리드 모드라면 '0'보다는 'Total'이라도 보여주는 게 낫다고 판단 (누락 방지)
                 if final_v == 0 and rt_v > 0 and use_hybrid_logic:
-                    final_v = rt_v
-                    final_l = rt_l
+                    final_v = rt_v; final_l = rt_l
                 
-                # --- 집계 ---
-                total_views += final_v
-                total_likes += final_l
+                total_views += final_v; total_likes += final_l
                 
                 if final_v > 0 and a_pct > 0:
                     w_avg_sum += (final_v * a_pct)
@@ -934,29 +873,18 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 
                 if rt_v >= 1000000: over_1m_count += 1
 
-                # [리스트 저장]
-                # period_views / period_likes에 계산된 하이브리드 값 저장
                 if final_v > 0:
                     top_video_stats.append({
-                        'id': vid_id,
-                        'title': id_map.get(vid_id, 'Unknown'),
-                        'views': rt_v,           # (참고용) 전체 누적 조회수
-                        'likes': rt_l,           # (참고용) 전체 누적 좋아요
-                        'period_views': final_v, # ✅ [핵심] 기간 내 조회수 (Hybrid)
-                        'period_likes': final_l, # ✅ [핵심] 기간 내 좋아요 (Hybrid)
+                        'id': vid_id, 'title': id_map.get(vid_id, 'Unknown'),
+                        'views': rt_v, 'likes': rt_l, 'period_views': final_v, 'period_likes': final_l,
                         'avg_pct': a_pct if a_pct > 0 else None,
                         'duration_min': parse_duration_to_minutes(rt_content_map.get(vid_id, {}).get('duration'))
                     })
 
-        except Exception as e:
-            # print(f"Error processing batch: {e}") 
-            pass
-
+        except: pass
         time.sleep(0.05)
 
     if not top_video_stats and total_views == 0: return None
-    
-    # [수정] 정렬 기준을 '기간 내 조회수'로 변경
     top_video_stats.sort(key=lambda x: x['period_views'], reverse=True)
 
     return {
@@ -970,7 +898,6 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         'over_1m_count': over_1m_count 
     }
 # endregion
-
 
 # region [5. 메인 UI 및 실행 로직 (Main UI & Execution)]
 # ==========================================
@@ -1080,11 +1007,11 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
         if not keyword.strip(): st.error("⚠️ 분석 IP를 입력해주세요.")
         else:
-            # 1. 챗봇용 날짜 저장 (문자열로 변환하여 저장)
+            # 1. 챗봇용 날짜 저장 (문자열 변환)
             vs_str, ve_str = v_start.strftime("%Y-%m-%d"), v_end.strftime("%Y-%m-%d")
             st.session_state['analysis_dates'] = {'start': vs_str, 'end': ve_str}
             
-            # 2. 분석용 날짜 준비 (Analytics API용 문자열)
+            # 2. 분석용 날짜 준비
             as_str = a_start.strftime("%Y-%m-%d"); ae_str = a_end.strftime("%Y-%m-%d")
             
             prog_bar = st.progress(0, text="데이터 분석 중...")
@@ -1095,7 +1022,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 add_script_run_ctx(ctx=ctx)
                 return process_analysis_channel(cd, kw, vs, ve, ast, aet)
 
-            # 3. [수정됨] worker에는 문자열(vs_str)이 아닌 날짜 객체(v_start)를 전달해야 함!
+            # [수정] worker에는 문자열(vs_str)이 아닌 날짜 객체(v_start)를 전달!
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
                 futures = {ex.submit(worker, ch, keyword, v_start, v_end, as_str, ae_str): ch for ch in data}
                 done = 0
@@ -1107,8 +1034,16 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
             prog_bar.empty()
             
-            st.session_state['analysis_raw_results'] = ch_details_results
-            st.session_state['analysis_keyword'] = keyword
+            # [수정] 결과가 0개일 때 처리 로직 추가
+            if ch_details_results:
+                st.session_state['analysis_raw_results'] = ch_details_results
+                st.session_state['analysis_keyword'] = keyword
+                st.success(f"분석 완료! 총 {len(ch_details_results)}개 채널에서 데이터를 찾았습니다.")
+            else:
+                st.session_state['analysis_raw_results'] = []
+                st.warning(f"⚠️ '{keyword}'에 대한 분석 결과가 없습니다.\n\n"
+                           f"1. **영상 업로드 기간**이 초기화되었는지 확인해보세요. (현재 설정: {vs_str} ~ {ve_str})\n"
+                           f"2. 키워드가 정확한지 확인해보세요.")
 
     if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw_results']:
         raw_data = st.session_state['analysis_raw_results']
@@ -1454,7 +1389,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 collected_text = collect_comments_fast(target_vids)
                 st.session_state["chat_context_comments"] = collected_text
                 
-                # E. 프롬프트 구성 (파싱 과정 없이 바로 주입)
+                # E. 프롬프트 구성 (파싱 과정 없이 바로 주입 + [수정] 테이블 구조 개선)
                 sys_prompt = (
                     "역할: 너는 엔터테인먼트/미디어 여론을 전문으로 분석하는 '수석 데이터 애널리스트'다.\n"
                     "목표: 제공된 댓글 데이터를 심층 분석하여 의사결정권자가 보기 편한 '인사이트 보고서'를 작성하라.\n"
@@ -1489,7 +1424,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 user_payload = (
                     f"분석 주제(키워드): {current_kw}\n"
                     f"분석 대상: {video_info_str}\n"
-                    f"댓글 데이터 샘플:\n{collected_text[:100000]}..." # 길이 제한
+                    f"댓글 데이터 샘플:\n{collected_text[:150000]}..." # [수정] 5만 -> 15만 상향
                 )
                 
                 # F. 첫 분석 실행
@@ -1544,7 +1479,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                     conversation_context += f"[{m['role']}]: {m['content']}\n"
 
                 payload_followup = (
-                    f"댓글 데이터:\n{context_comments[:100000]}\n\n"
+                    f"댓글 데이터:\n{context_comments[:150000]}\n\n" # [수정] 5만 -> 15만 상향
                     f"이전 대화:\n{conversation_context}\n\n"
                     f"사용자 질문: {prompt}"
                 )
