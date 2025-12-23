@@ -1078,15 +1078,14 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
         if not keyword.strip(): st.error("⚠️ 분석 IP를 입력해주세요.")
         else:
-            # ⬇️ [수정됨] 날짜 정보를 세션에 저장 (UGC 검색용)
+            # 1. 챗봇용 날짜 저장 (문자열로 변환하여 저장)
             vs_str, ve_str = v_start.strftime("%Y-%m-%d"), v_end.strftime("%Y-%m-%d")
             st.session_state['analysis_dates'] = {'start': vs_str, 'end': ve_str}
             
-            # 기존 로직 계속 수행
+            # 2. 분석용 날짜 준비 (Analytics API용 문자열)
             as_str = a_start.strftime("%Y-%m-%d"); ae_str = a_end.strftime("%Y-%m-%d")
             
             prog_bar = st.progress(0, text="데이터 분석 중...")
-            
             ch_details_results = []
             
             ctx = get_script_run_ctx()
@@ -1094,8 +1093,9 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 add_script_run_ctx(ctx=ctx)
                 return process_analysis_channel(cd, kw, vs, ve, ast, aet)
 
+            # 3. [수정됨] worker에는 문자열(vs_str)이 아닌 날짜 객체(v_start)를 전달해야 함!
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                futures = {ex.submit(worker, ch, keyword, vs_str, ve_str, as_str, ae_str): ch for ch in data}
+                futures = {ex.submit(worker, ch, keyword, v_start, v_end, as_str, ae_str): ch for ch in data}
                 done = 0
                 for f in as_completed(futures):
                     done += 1
