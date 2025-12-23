@@ -1078,7 +1078,11 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
         if not keyword.strip(): st.error("⚠️ 분석 IP를 입력해주세요.")
         else:
-            vs_str, ve_str = v_start, v_end
+            # ⬇️ [수정됨] 날짜 정보를 세션에 저장 (UGC 검색용)
+            vs_str, ve_str = v_start.strftime("%Y-%m-%d"), v_end.strftime("%Y-%m-%d")
+            st.session_state['analysis_dates'] = {'start': vs_str, 'end': ve_str}
+            
+            # 기존 로직 계속 수행
             as_str = a_start.strftime("%Y-%m-%d"); ae_str = a_end.strftime("%Y-%m-%d")
             
             prog_bar = st.progress(0, text="데이터 분석 중...")
@@ -1193,26 +1197,20 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                     st.plotly_chart(fig_trend, use_container_width=True)
                 st.write("")
 
-            # [이전 코드는 동일]
             st.markdown("##### 🥇 인기 영상 TOP 100 (기간 내 성과 기준)")
             with st.container(border=True):
                 if final_top_videos:
                     unique_vids_map = {v['id']: v for v in final_top_videos}
                     deduped_vids = list(unique_vids_map.values())
                     
-                    # [수정] 정렬 기준: period_views (기간 조회수)
                     top_vids = sorted(deduped_vids, key=lambda x: x['period_views'], reverse=True)[:100]
                     
                     df_top = pd.DataFrame(top_vids)
                     df_top['link'] = df_top['id'].apply(lambda x: f"https://youtu.be/{x}")
                     
-                    # [수정] 보여줄 컬럼: period_views, period_likes 사용
                     df_show = df_top[['title', 'period_views', 'avg_pct', 'period_likes', 'link']].copy()
-                    
-                    # [수정] 컬럼명 매핑
                     df_show.columns = ['제목', '조회수', '지속률(%)', '좋아요', '바로가기']
                     
-                    # 숫자 포맷팅
                     df_show['조회수'] = df_show['조회수'].apply(lambda x: f"{int(x):,}")
                     df_show['좋아요'] = df_show['좋아요'].apply(lambda x: f"{int(x):,}")
                     
@@ -1328,15 +1326,15 @@ def call_gemini_integrated(system_prompt, user_prompt):
             
     return "❌ AI 응답 생성 실패 (API 키 할당량 초과 또는 오류)"
 
-# [함수] UGC 영상 검색 (기존 채널 영상과 중복 제외)
-def search_ugc_videos(keyword, existing_ids, max_search=50):
+# [함수] UGC 영상 검색 (기간 필터 적용 + 중복 제외)
+def search_ugc_videos(keyword, existing_ids, start_date=None, end_date=None, max_search=50):
     if not YT_PUBLIC_KEYS: return []
     
-    # 공개 API 클라이언트 빌드 (Rotating)
     youtube_pub = None
     for key in YT_PUBLIC_KEYS:
         try:
             youtube_pub = googleapiclient.discovery.build('youtube', 'v3', developerKey=key)
+            # 키 유효성 테스트
             youtube_pub.search().list(part='id', q='test', maxResults=1).execute()
             break
         except: continue
@@ -1345,9 +1343,19 @@ def search_ugc_videos(keyword, existing_ids, max_search=50):
 
     ugc_ids = []
     try:
-        # 키워드로 검색
+        # 날짜 포맷 변환 (YYYY-MM-DD -> RFC 3339 포맷)
+        p_after = f"{start_date}T00:00:00Z" if start_date else None
+        p_before = f"{end_date}T23:59:59Z" if end_date else None
+
+        # 키워드로 검색 (기간 필터 적용)
         search_res = youtube_pub.search().list(
-            q=keyword, part="id", type="video", maxResults=max_search, order="relevance"
+            q=keyword, 
+            part="id", 
+            type="video", 
+            maxResults=max_search, 
+            order="relevance",
+            publishedAfter=p_after,   # [적용]
+            publishedBefore=p_before  # [적용]
         ).execute()
         
         found_ids = [item['id']['videoId'] for item in search_res.get('items', [])]
@@ -1359,7 +1367,8 @@ def search_ugc_videos(keyword, existing_ids, max_search=50):
                 ugc_ids.append(vid)
                 
     except Exception as e:
-        st.error(f"UGC 검색 중 오류: {e}")
+        # 검색 실패 시 조용히 넘김 (빈 리스트 반환)
+        pass
         
     return ugc_ids
 
@@ -1378,11 +1387,10 @@ def collect_comments_fast(video_ids, max_comments=2000):
     comments = []
     total_collected = 0
     
-    # 스레딩 대신 안정성을 위해 심플 루프 사용 (UI 블로킹 방지 위해 max 제한)
-    # 영상당 최대 100개만 빠르게 수집
+    # 빠른 수집을 위해 영상당 100개 제한, 최대 30개 영상만 샘플링
     limit_per_video = 100 
     
-    for vid in video_ids[:30]: # 상위 30개 영상만 샘플링
+    for vid in video_ids[:30]: 
         if total_collected >= max_comments: break
         try:
             req = youtube_pub.commentThreads().list(
@@ -1413,7 +1421,7 @@ if "chat_context_comments" not in st.session_state: st.session_state["chat_conte
 # 버튼: 분석 결과가 있을 때만 활성화
 if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw_results']:
     
-    # 1. 진입 버튼
+    # 1. 진입 버튼 (챗봇 비활성 상태일 때)
     if not st.session_state["chat_active"]:
         st.subheader("🤖 AI 심층 분석")
         st.caption("현재 분석된 데이터를 바탕으로 UGC(외부 반응)까지 포함하여 AI와 대화합니다.")
@@ -1424,17 +1432,22 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 current_kw = st.session_state.get('analysis_keyword', '')
                 raw_results = st.session_state['analysis_raw_results']
                 
+                # [적용] 저장해둔 날짜 꺼내오기
+                dates = st.session_state.get('analysis_dates', {})
+                v_start = dates.get('start')
+                v_end = dates.get('end')
+                
                 # B. 채널 내 영상 ID 추출
                 channel_vids = []
                 for ch in raw_results:
                     if 'top_video_stats' in ch:
                         channel_vids.extend([v['id'] for v in ch['top_video_stats']])
                 
-                # C. UGC(외부) 영상 추가 검색
-                ugc_vids = search_ugc_videos(current_kw, channel_vids)
+                # C. UGC(외부) 영상 추가 검색 (기간 필터 적용)
+                ugc_vids = search_ugc_videos(current_kw, channel_vids, start_date=v_start, end_date=v_end)
                 
                 # D. 댓글 수집 (채널 영상 일부 + UGC 영상 전체)
-                # 채널 영상은 상위 20개, UGC는 검색된 것 전체 활용
+                # 채널 영상은 상위 20개만, UGC는 검색된 것 전체 활용
                 target_vids = channel_vids[:20] + ugc_vids
                 collected_text = collect_comments_fast(target_vids)
                 st.session_state["chat_context_comments"] = collected_text
@@ -1450,16 +1463,20 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                     "4. [인사이트]: 특이점이나 리스크 요인.\n"
                 )
                 
+                video_info_str = f"채널 공식 영상 {len(channel_vids)}개 + UGC(외부) 영상 {len(ugc_vids)}개"
+                if v_start and v_end:
+                    video_info_str += f" (기간: {v_start} ~ {v_end})"
+
                 user_payload = (
                     f"분석 주제(키워드): {current_kw}\n"
-                    f"분석 데이터: 채널 공식 영상 {len(channel_vids)}개 + UGC(외부) 영상 {len(ugc_vids)}개\n"
+                    f"분석 대상: {video_info_str}\n"
                     f"댓글 데이터 샘플:\n{collected_text[:50000]}..." # 길이 제한
                 )
                 
                 # F. 첫 분석 실행
                 ai_response = call_gemini_integrated(sys_prompt, user_payload)
                 
-                # G. 세션 저장
+                # G. 세션 저장 및 챗봇 활성화
                 st.session_state["chat_history"].append({"role": "assistant", "content": ai_response})
                 st.session_state["chat_active"] = True
                 st.rerun()
@@ -1519,6 +1536,6 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 st.rerun()
 
 else:
+    # 데이터가 없을 때 안내 문구
     st.info("ℹ️ AI 대화 기능은 상단에서 [분석 시작]을 완료한 후에 사용할 수 있습니다.")
-
 # endregion
