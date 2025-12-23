@@ -12,7 +12,9 @@ import plotly.express as px
 import google.oauth2.credentials
 import googleapiclient.discovery
 import google.auth.transport.requests
-import extra_streamlit_components as stx  # [추가] 쿠키 매니저
+import extra_streamlit_components as stx 
+import google.generativeai as genai
+from googleapiclient.errors import HttpError
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1281,4 +1283,242 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
         else:
             st.warning("⚠️ 검색 결과가 없습니다.")
+# endregion
+
+# region [6. AI 댓글 분석 및 챗봇 (AI Chatbot Integration)]
+# ==========================================
+# 사용자 요청에 따라 애널리틱스 하단에 통합된 챗봇 모듈입니다.
+# 기존 ytcc_chatbot.py의 핵심 기능을 이식했습니다.
+# ==========================================
+
+# [설정] API 키 로드 (secrets.toml에 설정 필요)
+GEMINI_API_KEYS = st.secrets.get("GEMINI_API_KEYS", [])
+YT_PUBLIC_KEYS = st.secrets.get("YT_API_KEYS", [])
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+
+# [함수] Gemini 호출 (Rotating Key)
+def call_gemini_integrated(system_prompt, user_prompt):
+    if not GEMINI_API_KEYS: return "⚠️ 설정 오류: 'GEMINI_API_KEYS'가 secrets에 없습니다."
+    
+    import google.generativeai as genai
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+
+    # 안전 설정 해제
+    safety_settings = {
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    }
+
+    # 키 순환 시도
+    for key in GEMINI_API_KEYS:
+        try:
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system_prompt)
+            resp = model.generate_content(
+                user_prompt, 
+                safety_settings=safety_settings,
+                request_options={"timeout": 120}
+            )
+            if resp and hasattr(resp, 'text'):
+                return resp.text
+        except Exception as e:
+            continue # 다음 키 시도
+            
+    return "❌ AI 응답 생성 실패 (API 키 할당량 초과 또는 오류)"
+
+# [함수] UGC 영상 검색 (기존 채널 영상과 중복 제외)
+def search_ugc_videos(keyword, existing_ids, max_search=50):
+    if not YT_PUBLIC_KEYS: return []
+    
+    # 공개 API 클라이언트 빌드 (Rotating)
+    youtube_pub = None
+    for key in YT_PUBLIC_KEYS:
+        try:
+            youtube_pub = googleapiclient.discovery.build('youtube', 'v3', developerKey=key)
+            youtube_pub.search().list(part='id', q='test', maxResults=1).execute()
+            break
+        except: continue
+    
+    if not youtube_pub: return []
+
+    ugc_ids = []
+    try:
+        # 키워드로 검색
+        search_res = youtube_pub.search().list(
+            q=keyword, part="id", type="video", maxResults=max_search, order="relevance"
+        ).execute()
+        
+        found_ids = [item['id']['videoId'] for item in search_res.get('items', [])]
+        
+        # 중복 제거 (기존 분석된 채널 영상 ID 제외)
+        existing_set = set(existing_ids)
+        for vid in found_ids:
+            if vid not in existing_set:
+                ugc_ids.append(vid)
+                
+    except Exception as e:
+        st.error(f"UGC 검색 중 오류: {e}")
+        
+    return ugc_ids
+
+# [함수] 댓글 수집 (간소화된 버전)
+def collect_comments_fast(video_ids, max_comments=2000):
+    if not YT_PUBLIC_KEYS or not video_ids: return ""
+    
+    youtube_pub = None
+    for key in YT_PUBLIC_KEYS:
+        try:
+            youtube_pub = googleapiclient.discovery.build('youtube', 'v3', developerKey=key)
+            break
+        except: continue
+    if not youtube_pub: return ""
+
+    comments = []
+    total_collected = 0
+    
+    # 스레딩 대신 안정성을 위해 심플 루프 사용 (UI 블로킹 방지 위해 max 제한)
+    # 영상당 최대 100개만 빠르게 수집
+    limit_per_video = 100 
+    
+    for vid in video_ids[:30]: # 상위 30개 영상만 샘플링
+        if total_collected >= max_comments: break
+        try:
+            req = youtube_pub.commentThreads().list(
+                part="snippet", videoId=vid, maxResults=100, textFormat="plainText", order="relevance"
+            )
+            res = req.execute()
+            for item in res['items']:
+                snippet = item['snippet']['topLevelComment']['snippet']
+                text = snippet['textDisplay'].replace("\n", " ")
+                likes = snippet['likeCount']
+                comments.append(f"[♥{likes}] {text}")
+                total_collected += 1
+        except: continue
+        
+    return "\n".join(comments)
+
+
+# ==========================================
+# [UI] AI 대화하기 섹션
+# ==========================================
+st.divider()
+
+# 세션 상태 초기화
+if "chat_active" not in st.session_state: st.session_state["chat_active"] = False
+if "chat_history" not in st.session_state: st.session_state["chat_history"] = []
+if "chat_context_comments" not in st.session_state: st.session_state["chat_context_comments"] = ""
+
+# 버튼: 분석 결과가 있을 때만 활성화
+if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw_results']:
+    
+    # 1. 진입 버튼
+    if not st.session_state["chat_active"]:
+        st.subheader("🤖 AI 심층 분석")
+        st.caption("현재 분석된 데이터를 바탕으로 UGC(외부 반응)까지 포함하여 AI와 대화합니다.")
+        
+        if st.button("💬 AI와 대화하기 (UGC 포함)", type="primary"):
+            with st.spinner("🔄 외부 여론 수집 및 AI 분석 중입니다... (약 15~30초 소요)"):
+                # A. 데이터 준비
+                current_kw = st.session_state.get('analysis_keyword', '')
+                raw_results = st.session_state['analysis_raw_results']
+                
+                # B. 채널 내 영상 ID 추출
+                channel_vids = []
+                for ch in raw_results:
+                    if 'top_video_stats' in ch:
+                        channel_vids.extend([v['id'] for v in ch['top_video_stats']])
+                
+                # C. UGC(외부) 영상 추가 검색
+                ugc_vids = search_ugc_videos(current_kw, channel_vids)
+                
+                # D. 댓글 수집 (채널 영상 일부 + UGC 영상 전체)
+                # 채널 영상은 상위 20개, UGC는 검색된 것 전체 활용
+                target_vids = channel_vids[:20] + ugc_vids
+                collected_text = collect_comments_fast(target_vids)
+                st.session_state["chat_context_comments"] = collected_text
+                
+                # E. 프롬프트 구성 (파싱 과정 없이 바로 주입)
+                sys_prompt = (
+                    "역할: 너는 유튜브 댓글 데이터를 분석하는 '수석 애널리스트'다.\n"
+                    "목표: 제공된 댓글들을 분석하여 냉철하고 구조적인 보고서를 작성하라.\n"
+                    "형식:\n"
+                    "1. [3줄 요약]: 전체 여론 핵심 요약.\n"
+                    "2. [감성 분포]: 긍정/부정/중립 비율 (추정).\n"
+                    "3. [주요 토픽]: 반복되는 주제 3가지와 그에 대한 실제 댓글 인용(욕설 필터링).\n"
+                    "4. [인사이트]: 특이점이나 리스크 요인.\n"
+                )
+                
+                user_payload = (
+                    f"분석 주제(키워드): {current_kw}\n"
+                    f"분석 데이터: 채널 공식 영상 {len(channel_vids)}개 + UGC(외부) 영상 {len(ugc_vids)}개\n"
+                    f"댓글 데이터 샘플:\n{collected_text[:50000]}..." # 길이 제한
+                )
+                
+                # F. 첫 분석 실행
+                ai_response = call_gemini_integrated(sys_prompt, user_payload)
+                
+                # G. 세션 저장
+                st.session_state["chat_history"].append({"role": "assistant", "content": ai_response})
+                st.session_state["chat_active"] = True
+                st.rerun()
+
+    # 2. 채팅 인터페이스 (활성화 시)
+    else:
+        st.subheader(f"💬 AI 챗봇: {st.session_state.get('analysis_keyword', '분석')}")
+        
+        # 닫기 버튼
+        if st.button("❌ 대화 종료 및 초기화"):
+            st.session_state["chat_active"] = False
+            st.session_state["chat_history"] = []
+            st.session_state["chat_context_comments"] = ""
+            st.rerun()
+            
+        # 대화 기록 출력
+        chat_container = st.container(border=True)
+        with chat_container:
+            for msg in st.session_state["chat_history"]:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+        
+        # 후속 질문 입력
+        if prompt := st.chat_input("추가로 궁금한 점을 물어보세요 (예: 주연 배우 연기 반응은 어때?)"):
+            # 사용자 메시지 표시
+            st.session_state["chat_history"].append({"role": "user", "content": prompt})
+            with chat_container:
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+            
+            # AI 응답 생성
+            with st.spinner("AI가 답변을 생성 중입니다..."):
+                context_comments = st.session_state.get("chat_context_comments", "")
+                
+                sys_prompt_followup = (
+                    "역할: 너는 앞서 분석한 댓글 데이터를 바탕으로 사용자의 구체적인 질문에 답하는 조사관이다.\n"
+                    "규칙:\n"
+                    "1. 질문과 직접 관련된 댓글만 필터링하여 근거로 제시하라.\n"
+                    "2. 뇌피셜(추측)을 자제하고 데이터에 기반해 답하라.\n"
+                    "3. 댓글 인용 시 욕설은 마스킹 처리하라.\n"
+                )
+                
+                # 이전 대화 맥락 포함 (최근 2턴)
+                conversation_context = ""
+                for m in st.session_state["chat_history"][-4:]:
+                    conversation_context += f"[{m['role']}]: {m['content']}\n"
+
+                payload_followup = (
+                    f"댓글 데이터:\n{context_comments[:30000]}\n\n"
+                    f"이전 대화:\n{conversation_context}\n\n"
+                    f"사용자 질문: {prompt}"
+                )
+                
+                ai_reply = call_gemini_integrated(sys_prompt_followup, payload_followup)
+                
+                st.session_state["chat_history"].append({"role": "assistant", "content": ai_reply})
+                st.rerun()
+
+else:
+    st.info("ℹ️ AI 대화 기능은 상단에서 [분석 시작]을 완료한 후에 사용할 수 있습니다.")
+
 # endregion
