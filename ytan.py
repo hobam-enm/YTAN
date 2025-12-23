@@ -244,40 +244,42 @@ def parse_duration_to_minutes(duration_str):
     return round(total_sec / 60, 1)
 
 # [Github 자동 업로드 함수]
+# [수정] Github 업로드 함수 (성공/실패 여부와 메시지를 반환하도록 변경)
 def upload_to_github(file_path, content_list):
     """
     로컬에서 생성된 캐시 데이터를 GitHub 리포지토리에 영구 저장(Commit & Push)합니다.
+    Returns: (성공여부 Bool, 메시지 String)
     """
     try:
-        if "github" not in st.secrets: return 
+        if "github" not in st.secrets: 
+            return False, "설정 오류: secrets.toml에 [github] 섹션이 없습니다."
         
-        # 1. 시크릿에서 설정 로드
         gh_token = st.secrets["github"]["token"]
         gh_repo = st.secrets["github"]["repo_name"]
         gh_branch = st.secrets["github"]["branch"]
 
-        # 2. 깃허브 연결
+        # 깃허브 연결
         g = Github(gh_token)
         repo = g.get_repo(gh_repo)
         
-        # 3. 데이터 직렬화 (JSON 변환)
+        # 데이터 직렬화
         json_content = json.dumps(content_list, ensure_ascii=False, indent=2)
         commit_message = f"Update cache: {file_path} (via Streamlit App)"
         
-        # 4. 파일 업로드 (생성 또는 수정)
         try:
-            # 파일이 이미 있는지 확인 (브랜치 지정)
+            # 파일이 이미 있으면 수정(Update) 시도
             contents = repo.get_contents(file_path, ref=gh_branch)
-            # 있으면 수정 (Update)
             repo.update_file(contents.path, commit_message, json_content, contents.sha, branch=gh_branch)
-            print(f"✅ GitHub Updated: {file_path}")
         except GithubException:
-            # 없으면 생성 (Create)
+            # 파일이 없으면 생성(Create) 시도
             repo.create_file(file_path, commit_message, json_content, branch=gh_branch)
-            print(f"✅ GitHub Created: {file_path}")
             
+        # 성공 시 True 반환
+        return True, "OK"
+
     except Exception as e:
-        print(f"❌ GitHub Upload Error: {e}")
+        # 실패 시 False와 에러 메시지 반환
+        return False, str(e)
 # endregion
 
 
