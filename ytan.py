@@ -177,6 +177,24 @@ custom_css = """
         .stDataFrame { border: 1px solid #f0f0f0; border-radius: 8px; }
     </style>
 """
+
+REPORT_CSS = """
+<style>
+.yt-report { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+.yt-report .badge { display:inline-block; padding:4px 10px; border-radius:999px; background:#f1f5f9; margin-right:6px; font-size:12px; }
+.yt-report .grid.two { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+.yt-report .card { border:1px solid #e5e7eb; border-radius:14px; padding:14px; background:#fff; box-shadow: 0 6px 18px rgba(0,0,0,0.04); margin-bottom:12px; }
+.yt-report table { width:100%; border-collapse: collapse; }
+.yt-report th { text-align:left; padding:10px; background:#f8fafc; border:1px solid #e5e7eb; width: 180px; vertical-align: top; }
+.yt-report td { padding:10px; border:1px solid #e5e7eb; vertical-align: top; }
+.yt-report ul { margin: 0; padding-left: 18px; }
+.yt-report .muted { color:#64748b; font-weight: normal; }
+.yt-report .note { color:#64748b; margin-top:8px; font-size:12px; }
+.yt-report .quote { border-left: 3px solid #cbd5e1; padding:8px 10px; margin: 6px 0; background:#f8fafc; border-radius:10px; }
+</style>
+"""
+st.markdown(REPORT_CSS, unsafe_allow_html=True)
+
 st.markdown(custom_css, unsafe_allow_html=True)
 
 MAX_WORKERS = 7
