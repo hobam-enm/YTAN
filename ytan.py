@@ -217,6 +217,33 @@ def load_text_file(filename: str) -> str:
     path = base_dir / filename
     return path.read_text(encoding="utf-8")
 
+def load_prompt_file(filename: str) -> str:
+    """Prompt 파일을 읽어온 뒤, 관리 편의상 생길 수 있는 포맷까지 자동 정리합니다.
+
+    - 권장: md 파일에 '그대로' 프롬프트를 붙여넣기 (실제 개행 포함)
+    - 호환: 기존처럼 파이썬 문자열 조각(예: "....\n")을 그대로 붙여넣은 경우에도
+            따옴표 안 텍스트를 합치고 \n을 실제 개행으로 복원합니다.
+    """
+    raw = load_text_file(filename)
+    if not raw:
+        return ""
+
+    raw_stripped = raw.strip()
+
+    # 1) 파이썬 문자열 조각 형태("...\n")가 반복되는 케이스 자동 복원
+    #    - 따옴표 안 내용만 모두 추출해 이어붙임
+    #    - \n -> 실제 개행
+    #    - \" -> "
+    if raw_stripped.count('"') >= 10 and "\\n" in raw_stripped:
+        parts = re.findall(r'"([^"]*)"', raw_stripped)
+        if parts:
+            merged = "".join(parts)
+            merged = merged.replace("\\n", "\n").replace("\\t", "\t")  # 줄/탭 복원
+            merged = merged.replace('\\"', '"')
+            return merged.strip()
+
+    return raw_stripped
+
 
 def format_korean_number(num):
     if num == 0: return "0회"
@@ -1498,7 +1525,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 st.session_state["chat_context_comments"] = collected_text
                 
                 # E. 프롬프트 구성 (전문성 강화 및 정형화된 포맷 적용)
-                sys_prompt = ( load_text_file(PROMPT_FILE_1ST))
+                sys_prompt = load_prompt_file(PROMPT_FILE_1ST)
 
                 
                 video_info_str = f"채널 공식 영상 {len(channel_vids)}개 + UGC(외부) 영상 {len(ugc_vids)}개"
