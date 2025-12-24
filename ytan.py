@@ -1312,12 +1312,13 @@ GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 # [함수] Gemini 호출 (Rotating Key)
 def call_gemini_integrated(system_prompt, user_prompt):
-    if not GEMINI_API_KEYS: return "⚠️ 설정 오류: 'GEMINI_API_KEYS'가 secrets에 없습니다."
-    
+    if not GEMINI_API_KEYS:
+        return "⚠️ 설정 오류: 'GEMINI_API_KEYS'가 secrets에 없습니다."
+
     import google.generativeai as genai
     from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-    # 안전 설정 해제
+    # 안전 설정 해제(기존 유지)
     safety_settings = {
         HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -1325,22 +1326,43 @@ def call_gemini_integrated(system_prompt, user_prompt):
         HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
     }
 
+    # 출력 길이/형식 안정화용 generation_config
+    generation_config = {
+        "max_output_tokens": 8192,  # ✅ 답변 길이(짤림) 핵심
+        "temperature": 0.2,         # ✅ 표/규격 유지(낮을수록 형식 안정)
+        # "top_p": 0.9,             # 필요하면 사용
+        # "top_k": 40,              # 필요하면 사용
+    }
+
     # 키 순환 시도
+    last_err = None
     for key in GEMINI_API_KEYS:
         try:
             genai.configure(api_key=key)
-            model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system_prompt)
-            resp = model.generate_content(
-                user_prompt, 
-                safety_settings=safety_settings,
-                request_options={"timeout": 120}
+            model = genai.GenerativeModel(
+                GEMINI_MODEL,
+                system_instruction=system_prompt
             )
-            if resp and hasattr(resp, 'text'):
+
+            resp = model.generate_content(
+                user_prompt,
+                safety_settings=safety_settings,
+                generation_config=generation_config,
+                request_options={"timeout": 180}  # ✅ 길어지면 120초는 빡빡해서 늘림
+            )
+
+            # 정상 텍스트 반환
+            if resp and hasattr(resp, "text") and resp.text:
                 return resp.text
+
+            # 혹시 text가 비어있는 케이스 대비
+            last_err = "⚠️ AI 응답은 생성됐지만 text가 비어있습니다."
         except Exception as e:
-            continue # 다음 키 시도
-            
-    return "❌ AI 응답 생성 실패 (API 키 할당량 초과 또는 오류)"
+            last_err = e
+            continue  # 다음 키 시도
+
+    return f"❌ AI 응답 생성 실패 (API 키 할당량 초과 또는 오류)\n{last_err}"
+
 
 # [함수] UGC 영상 검색 (기간 필터 + OST 제외 + 중복 제외)
 def search_ugc_videos(keyword, existing_ids, start_date=None, end_date=None, max_search=50):
