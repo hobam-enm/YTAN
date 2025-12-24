@@ -16,7 +16,9 @@ import extra_streamlit_components as stx
 import google.generativeai as genai
 from googleapiclient.errors import HttpError
 import html
+import html as _html
 from pathlib import Path
+from streamlit.components.v1 import html as st_html
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -246,6 +248,51 @@ def normalize_text(text):
     return re.sub(r'[^a-zA-Z0-9가-힣]', '', text).lower()
 
 PROMPT_FILE_1ST = "1차 질문 프롬프트.md"
+
+def extract_report_html(text: str) -> str | None:
+    """
+    모델 응답에서 <!--REPORT_START--> ~ <!--REPORT_END--> 구간만 뽑아서
+    '진짜 HTML'로 정리해 반환. 없으면 None.
+    - 중간에 ```html / ``` 코드펜스가 섞여도 제거
+    - 들여쓰기(마크다운 코드블록 유발) 제거
+    - 혹시 &lt;div&gt; 형태로 이스케이프된 HTML이면 unescape
+    """
+    raw = (text or "")
+
+    start = "<!--REPORT_START-->"
+    end = "<!--REPORT_END-->"
+    if start not in raw or end not in raw:
+        return None
+
+    body = raw.split(start, 1)[1].split(end, 1)[0]
+
+    # (1) 코드펜스 제거 (중간에 섞여도 제거)
+    body = re.sub(r"```html\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"```", "", body)
+
+    # (2) 혹시 전체가 escape돼 있으면 복구
+    # (예: &lt;div&gt; ... )
+    if "&lt;" in body and "&gt;" in body:
+        body = _html.unescape(body)
+
+    # (3) 줄 단위로 앞 공백 제거(마크다운 코드블록 방지)
+    lines = [ln.lstrip() for ln in body.splitlines()]
+    body = "\n".join(lines).strip()
+
+    return body if body else None
+
+def render_assistant_content(content: str, css: str = "", height: int = 900):
+    """
+    - REPORT 마커가 있으면: components.html로 렌더(마크다운 파서 회피 → 깨짐 방지)
+    - 없으면: 기존처럼 마크다운 렌더(필요시 <br>만 허용 등)
+    """
+    report_html = extract_report_html(content)
+    if report_html is not None:
+        st_html(css + report_html, height=height, scrolling=True)
+        return
+
+    # 리포트가 아니면 기존 방식(원하면 너 기존 render_md_allow_br 호출)
+    st.markdown(content)
 
 def load_text_file(filename: str) -> str:
     base_dir = Path(__file__).resolve().parent  # ytan.py가 있는 폴더
@@ -1620,7 +1667,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
             for msg in st.session_state["chat_history"]:
                 with st.chat_message(msg["role"]):
                     if msg["role"] == "assistant":
-                        st.markdown(render_md_allow_br(msg["content"]), unsafe_allow_html=True)
+                        render_assistant_content(msg["content"], css=REPORT_CSS, height=900)
                     else:
                         st.markdown(msg["content"]) 
         
