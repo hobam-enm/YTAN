@@ -1556,7 +1556,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 # [설정] API 키 로드 (secrets.toml에 설정 필요)
 GEMINI_API_KEYS = st.secrets.get("GEMINI_API_KEYS", [])
 YT_PUBLIC_KEYS = st.secrets.get("YT_API_KEYS", [])
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MODEL = "gemini-3-flash-preview"
 
 # [함수] Gemini 호출 (Rotating Key)
 def call_gemini_integrated(system_prompt, user_prompt):
