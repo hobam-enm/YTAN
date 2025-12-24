@@ -15,6 +15,7 @@ import google.auth.transport.requests
 import extra_streamlit_components as stx 
 import google.generativeai as genai
 from googleapiclient.errors import HttpError
+import html
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -191,6 +192,14 @@ ISO_MAPPING = {
     'BR': 'BRA', 'MX': 'MEX', 'RU': 'RUS', 'GB': 'GBR', 'DE': 'DEU',
     'FR': 'FRA', 'CA': 'CAN', 'AU': 'AUS', 'HK': 'HKG', 'SG': 'SGP'
 }
+
+def render_md_allow_br(text: str) -> str:
+    # 1) 전부 escape 해서 HTML 주입 차단
+    escaped = html.escape(text or "")
+
+    # 2) <br> / <br/> / <br /> 만 다시 복원
+    escaped = re.sub(r"&lt;br\s*/?&gt;", "<br>", escaped, flags=re.IGNORECASE)
+    return escaped
 # endregion
 
 
@@ -1348,37 +1357,88 @@ def search_ugc_videos(keyword, existing_ids, start_date=None, end_date=None, max
     return ugc_ids
 
 # [함수] 댓글 수집 (제한 대폭 완화)
-def collect_comments_fast(video_ids, max_comments=10000): # 기본값 10,000개로 상향
-    if not YT_PUBLIC_KEYS or not video_ids: return ""
-    
-    youtube_pub = None
-    for key in YT_PUBLIC_KEYS:
-        try:
-            youtube_pub = googleapiclient.discovery.build('youtube', 'v3', developerKey=key)
-            break
-        except: continue
-    if not youtube_pub: return ""
+def collect_comments_fast(video_ids, max_comments=10000, max_workers=None):
+    """
+    - 영상별 commentThreads.list(최대 100개) 호출을 ThreadPool로 병렬화
+    - Streamlit UI 객체(st.*)는 스레드 안에서 절대 건드리지 않음
+    """
+    if not YT_PUBLIC_KEYS or not video_ids:
+        return ""
 
-    comments = []
-    total_collected = 0
-    
-    # [수정] 영상 개수 제한(slice) 제거: 모든 영상을 순회
-    for vid in video_ids: 
-        if total_collected >= max_comments: break
+    # 중복 제거(순서 유지)
+    seen = set()
+    video_ids = [v for v in video_ids if not (v in seen or seen.add(v))]
+
+    # 워커 수: 너무 크게 잡으면 429/쿼터/속도 역효과 날 수 있음
+    # 기본값: MAX_WORKERS(파일 상수) 또는 8 중 작은 값 권장
+    if max_workers is None:
+        max_workers = min(8, max(1, MAX_WORKERS))  # MAX_WORKERS는 파일 상수(현재 7)
+    max_workers = max(1, min(max_workers, len(video_ids)))
+
+    # 스레드 로컬로 "키별 youtube client" 캐시 (build 비용 절감)
+    import threading
+    _tls = threading.local()
+
+    def _get_client(dev_key: str):
+        if not hasattr(_tls, "clients"):
+            _tls.clients = {}
+        if dev_key not in _tls.clients:
+            # cache_discovery=False: discovery 캐시/IO 줄여서 build 조금 가벼워짐
+            _tls.clients[dev_key] = googleapiclient.discovery.build(
+                "youtube", "v3", developerKey=dev_key, cache_discovery=False
+            )
+        return _tls.clients[dev_key]
+
+    def _fetch_one(vid: str, dev_key: str):
+        out = []
         try:
-            # 영상당 최대 100개씩 수집 (API 1회 호출 최대치)
-            req = youtube_pub.commentThreads().list(
-                part="snippet", videoId=vid, maxResults=100, textFormat="plainText", order="relevance"
+            yt = _get_client(dev_key)
+            req = yt.commentThreads().list(
+                part="snippet",
+                videoId=vid,
+                maxResults=100,                 # 1회 최대
+                textFormat="plainText",
+                order="relevance"
             )
             res = req.execute()
-            for item in res['items']:
-                snippet = item['snippet']['topLevelComment']['snippet']
-                text = snippet['textDisplay'].replace("\n", " ")
-                likes = snippet['likeCount']
-                comments.append(f"[♥{likes}] {text}")
-                total_collected += 1
-        except: continue
-        
+            for item in res.get("items", []):
+                snip = item["snippet"]["topLevelComment"]["snippet"]
+                text = (snip.get("textDisplay") or "").replace("\n", " ")
+                likes = int(snip.get("likeCount") or 0)
+                out.append((likes, text))
+        except Exception:
+            # 댓글 비활성/차단/권한/일시적 에러 등은 그냥 스킵
+            pass
+        return out
+
+    comments = []
+    total = 0
+
+    # 배치 단위로 future를 만들면 메모리/캔슬이 좀 더 수월함
+    batch_size = max_workers * 6
+
+    def _chunks(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i+n]
+
+    submit_counter = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for batch in _chunks(video_ids, batch_size):
+            futures = []
+            for vid in batch:
+                dev_key = YT_PUBLIC_KEYS[submit_counter % len(YT_PUBLIC_KEYS)]
+                submit_counter += 1
+                futures.append(ex.submit(_fetch_one, vid, dev_key))
+
+            for fut in as_completed(futures):
+                rows = fut.result() or []
+                for likes, text in rows:
+                    comments.append(f"[♥{likes}] {text}")
+                    total += 1
+                    if total >= max_comments:
+                        return "\n".join(comments)
+
     return "\n".join(comments)
 
 
@@ -1429,7 +1489,6 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 st.session_state["chat_context_comments"] = collected_text
                 
                 # E. 프롬프트 구성 (전문성 강화 및 정형화된 포맷 적용)
-                # E. 프롬프트 구성 (액션 과다 방지 + 정형 포맷)
                 sys_prompt = (
                     "역할: 너는 엔터테인먼트/미디어 여론을 심층 분석해 '관측 가능한 사실'과 '해석'을 구분해 보고하는 수석 콘텐츠 전략가다.\n"
                     "목표: 방대한 댓글 데이터에서 (1) 반응의 구조(무엇이 왜 먹히는지), (2) 갈등 지점(무엇이 왜 갈리는지), (3) 잠재 리스크(작게 시작되는 불만의 패턴)를 도출하되,\n"
@@ -1460,9 +1519,9 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                     "## 2. 감성 점유율 (Sentiment Breakdown, 추정치)\n"
                     "| 구분 | 점유율(%) | 상세 분석 (핵심 요약 및 키워드) |\n"
                     "|:---:|:---:|:---|\n"
-                    "| **긍정** | OO% | **[호평 요인]** (구체 요인 2~3개) <br> **[키워드]** (예: 사이다, 케미, 연기력) |\n"
-                    "| **부정** | OO% | **[불호 요인]** (구체 요인 2~3개) <br> **[키워드]** (예: 캐붕, 개연성, 고구마) |\n"
-                    "| **중립/논쟁** | OO% | **[논쟁 축]** (해석/호불호가 갈리는 기준) <br> **[키워드]** (예: 떡밥, 회수, 열린결말) |\n\n"
+                    "| **긍정** | OO% | **[호평 요인]** (구체 요인 2~3개) <br> **[키워드]** |\n"
+                    "| **부정** | OO% | **[불호 요인]** (구체 요인 2~3개) <br> **[키워드]**  |\n"
+                    "| **중립/논쟁** | OO% | **[논쟁 축]** (해석/호불호가 갈리는 기준) <br> **[키워드]**  |\n\n"
 
                     "## 3. 핵심 토픽 심층 분석 (Top 3 Topics)\n"
                     "### ① [토픽 키워드 1]\n"
@@ -1525,7 +1584,10 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
         with chat_container:
             for msg in st.session_state["chat_history"]:
                 with st.chat_message(msg["role"]):
-                    st.markdown(msg["content"])
+                    if msg["role"] == "assistant":
+                        st.markdown(render_md_allow_br(msg["content"]), unsafe_allow_html=True)
+                    else:
+                        st.markdown(msg["content"]) 
         
         # 후속 질문 입력
         if prompt := st.chat_input("추가로 궁금한 점을 물어보세요 (예: 주연 배우 연기 반응은 어때?)"):
