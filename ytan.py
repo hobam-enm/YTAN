@@ -213,12 +213,29 @@ ISO_MAPPING = {
 }
 
 def render_md_allow_br(text: str) -> str:
-    # 1) 전부 escape 해서 HTML 주입 차단
-    escaped = html.escape(text or "")
+    """
+    - 기본은 안전하게 escape + <br>만 허용(기존 동작 유지)
+    - 단, 모델이 HTML 리포트를 생성한 경우(<!--REPORT_START--> ~ <!--REPORT_END--> 포함)는
+      해당 구간만 'raw HTML'로 렌더링한다.
+    """
+    raw = (text or "").strip()
 
-    # 2) <br> / <br/> / <br /> 만 다시 복원
+    # 0) 코드펜스 제거 (```html ... ``` 형태로 나오는 경우 대비)
+    raw = re.sub(r"^\s*```[a-zA-Z]*\s*", "", raw)
+    raw = re.sub(r"\s*```\s*$", "", raw)
+
+    # 1) HTML 리포트 마커가 있으면 그 구간만 그대로 반환 (escape 금지)
+    start = "<!--REPORT_START-->"
+    end = "<!--REPORT_END-->"
+    if start in raw and end in raw:
+        raw = raw.split(start, 1)[1].split(end, 1)[0].strip()
+        return raw  # ✅ raw HTML
+
+    # 2) 그 외에는 기존처럼: 전부 escape 후 <br>만 복원
+    escaped = html.escape(raw)
     escaped = re.sub(r"&lt;br\s*/?&gt;", "<br>", escaped, flags=re.IGNORECASE)
     return escaped
+
 # endregion
 
 
