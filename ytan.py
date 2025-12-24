@@ -216,27 +216,31 @@ ISO_MAPPING = {
 
 def render_md_allow_br(text: str) -> str:
     """
-    - 기본은 안전하게 escape + <br>만 허용(기존 동작 유지)
-    - 단, 모델이 HTML 리포트를 생성한 경우(<!--REPORT_START--> ~ <!--REPORT_END--> 포함)는
-      해당 구간만 'raw HTML'로 렌더링한다.
+    - 기본은 안전하게 escape + <br>만 허용
+    - 단, <!--REPORT_START--> ~ <!--REPORT_END--> 포함 시 해당 구간은 raw HTML로 렌더링
     """
     raw = (text or "").strip()
 
-    # 0) 코드펜스 제거 (```html ... ``` 형태로 나오는 경우 대비)
+    # 0) 코드펜스 제거 (```html ... ``` 형태 대비)
     raw = re.sub(r"^\s*```[a-zA-Z]*\s*", "", raw)
     raw = re.sub(r"\s*```\s*$", "", raw)
 
-    # 1) HTML 리포트 마커가 있으면 그 구간만 그대로 반환 (escape 금지)
     start = "<!--REPORT_START-->"
     end = "<!--REPORT_END-->"
     if start in raw and end in raw:
-        raw = raw.split(start, 1)[1].split(end, 1)[0].strip()
-        return raw  # ✅ raw HTML
+        body = raw.split(start, 1)[1].split(end, 1)[0]
 
-    # 2) 그 외에는 기존처럼: 전부 escape 후 <br>만 복원
+        # ✅ 들여쓰기 제거(마크다운 코드블록 방지)
+        lines = [ln.lstrip() for ln in body.splitlines()]
+        body = "\n".join(lines).strip()
+
+        return body  # raw HTML
+
+    # 그 외: 전부 escape 후 <br>만 복원
     escaped = html.escape(raw)
     escaped = re.sub(r"&lt;br\s*/?&gt;", "<br>", escaped, flags=re.IGNORECASE)
     return escaped
+
 
 # endregion
 
@@ -283,16 +287,39 @@ def extract_report_html(text: str) -> str | None:
 
 def render_assistant_content(content: str, css: str = "", height: int = 900):
     """
-    - REPORT 마커가 있으면: components.html로 렌더(마크다운 파서 회피 → 깨짐 방지)
-    - 없으면: 기존처럼 마크다운 렌더(필요시 <br>만 허용 등)
+    - REPORT 마커가 있으면: components.html로 렌더
+    - 마커가 없더라도 'HTML로 보이는' 응답이면: components.html로 렌더(들여쓰기/코드펜스 정리 후)
+    - 그 외: 안전 마크다운(escape + <br> 허용)
     """
-    report_html = extract_report_html(content)
+    raw = (content or "").strip()
+
+    # 1) 정상 케이스: REPORT 마커 기반 추출
+    report_html = extract_report_html(raw)
     if report_html is not None:
         st_html(css + report_html, height=height, scrolling=True)
         return
 
-    # 리포트가 아니면 기존 방식(원하면 너 기존 render_md_allow_br 호출)
-    st.markdown(content)
+    # 2) 마커가 빠졌는데 HTML 덩어리만 온 케이스(가끔 Gemini가 이럼)
+    raw2 = re.sub(r"^\s*```html\s*", "", raw, flags=re.IGNORECASE)
+    raw2 = re.sub(r"^\s*```[a-zA-Z]*\s*", "", raw2)
+    raw2 = re.sub(r"\s*```\s*$", "", raw2).strip()
+
+    # 들여쓰기 제거(코드블록 방지)
+    raw2 = "\n".join([ln.lstrip() for ln in raw2.splitlines()]).strip()
+
+    looks_like_html = (
+        "<div" in raw2[:500].lower()
+        or "<table" in raw2[:500].lower()
+        or "class=\"yt-report\"" in raw2[:1500].lower()
+        or "class='yt-report'" in raw2[:1500].lower()
+    )
+    if looks_like_html:
+        st_html(css + raw2, height=height, scrolling=True)
+        return
+
+    # 3) 일반 텍스트/마크다운 fallback (안전)
+    st.markdown(render_md_allow_br(raw), unsafe_allow_html=True)
+
 
 def load_text_file(filename: str) -> str:
     base_dir = Path(__file__).resolve().parent  # ytan.py가 있는 폴더
