@@ -16,6 +16,7 @@ import extra_streamlit_components as stx
 import google.generativeai as genai
 from googleapiclient.errors import HttpError
 import html
+from pathlib import Path
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -208,6 +209,14 @@ def render_md_allow_br(text: str) -> str:
 def normalize_text(text):
     if not text: return ""
     return re.sub(r'[^a-zA-Z0-9가-힣]', '', text).lower()
+
+PROMPT_FILE_1ST = "1차 질문 프롬프트.md"
+
+def load_text_file(filename: str) -> str:
+    base_dir = Path(__file__).resolve().parent  # ytan.py가 있는 폴더
+    path = base_dir / filename
+    return path.read_text(encoding="utf-8")
+
 
 def format_korean_number(num):
     if num == 0: return "0회"
@@ -1489,65 +1498,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 st.session_state["chat_context_comments"] = collected_text
                 
                 # E. 프롬프트 구성 (전문성 강화 및 정형화된 포맷 적용)
-                sys_prompt = (
-                    "역할: 너는 엔터테인먼트/미디어 여론을 심층 분석해 '관측 가능한 사실'과 '해석'을 구분해 보고하는 수석 콘텐츠 전략가다.\n"
-                    "목표: 방대한 댓글 데이터에서 (1) 반응의 구조(무엇이 왜 먹히는지), (2) 갈등 지점(무엇이 왜 갈리는지), (3) 잠재 리스크(작게 시작되는 불만의 패턴)를 도출하되,\n"
-                    "      과도한 실행 지시/캠페인 액션 제안은 최소화하고 '모니터링 관점의 체크포인트'로만 정리하라.\n\n"
-
-                    "=== [분석 원칙] ===\n"
-                    "1. 냉철한 구체화: '재밌다/좋다/별로' 같은 추상어 금지. 반드시 구체 요인으로 번역하라.\n"
-                    "2. 키워드 포착: 시청자 구어(예: 사이다/고구마/캐붕/케미/똥촉/빌드업/떡밥/회수)를 반드시 수집·분류하라.\n"
-                    "3. 근거 우선: 모든 주장(해석 포함)은 대표 댓글 인용으로 뒷받침하라. 인용 없는 단정 금지.\n"
-                    "4. 배제 규칙: 배경음악(OST), 가수/음원 홍보, 음원 순위 언급은 분석에서 제외하라.\n"
-                    "5. 좋아요 가중치(선택): 댓글이 '[♥숫자]'로 시작하면, '확산/공감 강도' 참고 지표로만 활용하되 과신하지 말 것.\n"
-                    "6. 불확실성 표기: 표의 점유율(%)은 '추정치'로 표기하고, 데이터가 편향될 수 있는 이유(추천 알고리즘/표본/팬덤)를 1줄로 언급하라.\n\n"
-                    "=== [출력 포맷팅 규칙] ===\n"
-                    "1. 표 포맷: '감성 점유율'은 반드시 Markdown 표로 작성.\n"
-                    "   - 셀 내부 줄바꿈은 반드시 <br> 만 사용.\n"
-                    "   - <br> 외의 다른 HTML 태그는 절대 사용하지 말 것.\n"
-                    "2. 인용구 포맷: 댓글 인용은 아래 형식 고정.\n"
-                    "   > - \"댓글...\" \n"
-                    "   (섹션당 최대 5개, 욕설/비하/개인정보는 ***로 마스킹)\n"
-                    "3. 가독성: 섹션 사이 한 줄 공백 유지.\n\n"
-
-                    "=== [필수 출력 포맷 (Markdown)] ===\n"
-                    "## 1. Executive Summary (핵심 3줄 요약)\n"
-                    "- **[핵심 흐름]**: (여론을 관통하는 가장 큰 특징)\n"
-                    "- **[주요 이슈]**: (가장 많이 갈리거나 화제가 된 지점)\n"
-                    "- **[성과/반응]**: (만족/기대/이탈 신호를 균형 있게)\n\n"
-
-                    "## 2. 감성 점유율 (Sentiment Breakdown, 추정치)\n"
-                    "| 구분 | 점유율(%) | 상세 분석 (핵심 요약 및 키워드) |\n"
-                    "|:---:|:---:|:---|\n"
-                    "| **긍정** | OO% | **[호평 요인]** (구체 요인 2~3개) <br> **[키워드]** |\n"
-                    "| **부정** | OO% | **[불호 요인]** (구체 요인 2~3개) <br> **[키워드]**  |\n"
-                    "| **중립/논쟁** | OO% | **[논쟁 축]** (해석/호불호가 갈리는 기준) <br> **[키워드]**  |\n\n"
-
-                    "## 3. 핵심 토픽 심층 분석 (Top 3 Topics)\n"
-                    "### ① [토픽 키워드 1]\n"
-                    "- **반응의 구조**: (무엇이 어떤 감정을 만들었는지 '원인→반응'으로)\n"
-                    "- **실제 여론**:\n"
-                    "> - \"...\"\n"
-                    "> - \"...\"\n\n"
-
-                    "### ② [토픽 키워드 2]\n"
-                    "- **반응의 구조**: ...\n"
-                    "- **실제 여론**:\n"
-                    "> - \"...\"\n\n"
-
-                    "### ③ [토픽 키워드 3]\n"
-                    "- **반응의 구조**: ...\n"
-                    "- **실제 여론**:\n"
-                    "> - \"...\"\n\n"
-
-                    "## 4. Analyst Notes (해석 & 모니터링)\n"
-                    "### ✅ 관측된 ‘기회 신호’(해석)\n"
-                    "- (확산/공감이 붙는 패턴을 '관측 기반'으로 2~3줄)\n\n"
-                    "### ⚠️ 관측된 ‘리스크 신호’(해석)\n"
-                    "- (이탈로 커질 수 있는 불만 패턴을 '관측 기반'으로 2~3줄)\n\n"
-                    "### 🔎 체크포인트 (액션 지시 금지)\n"
-                    "- (향후 댓글에서 추적하면 좋은 지표/키워드/갈등축을 최대 2개)\n"
-                )
+                sys_prompt = ( load_text_file(PROMPT_FILE_1ST))
 
                 
                 video_info_str = f"채널 공식 영상 {len(channel_vids)}개 + UGC(외부) 영상 {len(ugc_vids)}개"
