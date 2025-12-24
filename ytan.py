@@ -243,16 +243,16 @@ def parse_duration_to_minutes(duration_str):
     total_sec = (int(h or 0) * 3600) + (int(m or 0) * 60) + (int(s or 0))
     return round(total_sec / 60, 1)
 
-# [수정] Github 업로드 함수 (한글 자모 분리 및 특수문자 완벽 대응)
+# [수정] Github 업로드 함수 (한글 자모 분리 + 409 충돌 자동 복구)
 def upload_to_github(file_path, content_list):
     """
     로컬 캐시 데이터를 GitHub에 저장합니다.
-    한글 파일명 비교 시 발생하는 NFC/NFD(자모 분리) 문제를 해결했습니다.
+    1. 한글 자모 분리(NFC/NFD) 문제 해결
+    2. 409 Conflict(SHA 불일치) 발생 시 자동 재시도
     """
-    import unicodedata # 한글 정규화를 위한 라이브러리
+    import unicodedata
 
     def normalize_str(s):
-        # 문자열을 NFC(표준 통합형)로 강제 변환하여 비교
         return unicodedata.normalize('NFC', s) if s else ""
 
     try:
@@ -269,34 +269,45 @@ def upload_to_github(file_path, content_list):
         json_content = json.dumps(content_list, ensure_ascii=False, indent=2)
         commit_message = f"Update cache: {file_path} (via Streamlit App)"
         
-        # 1. 저장소의 모든 파일 목록 가져오기 (루트 경로)
+        # 1. 저장소의 모든 파일 목록 가져오기 (파일명 정규화 비교를 위해)
         contents = repo.get_contents("", ref=gh_branch)
         
         target_sha = None
         target_path_on_git = file_path # 기본값은 로컬 파일명
         
-        # 2. 정규화된 이름으로 파일 찾기 (여기가 핵심!)
+        # 2. 정규화된 이름으로 파일 찾기
         search_name = normalize_str(file_path)
-        
         for c in contents:
-            # 깃허브에 있는 파일명도 정규화해서 비교
             if normalize_str(c.path) == search_name:
                 target_sha = c.sha
-                target_path_on_git = c.path # 깃허브에 저장된 실제 경로 사용
+                target_path_on_git = c.path # 깃허브 실존 경로
                 break
         
-        # 3. 찾았으면 Update, 없으면 Create
-        if target_sha:
-            repo.update_file(target_path_on_git, commit_message, json_content, target_sha, branch=gh_branch)
-            return True, "Updated (SHA Found)"
-        else:
-            repo.create_file(file_path, commit_message, json_content, branch=gh_branch)
-            return True, "Created (New File)"
+        # 3. 저장 시도 (재시도 로직 포함)
+        try:
+            if target_sha:
+                # 수정 (Update)
+                repo.update_file(target_path_on_git, commit_message, json_content, target_sha, branch=gh_branch)
+                return True, "Updated (SHA Found)"
+            else:
+                # 생성 (Create)
+                repo.create_file(file_path, commit_message, json_content, branch=gh_branch)
+                return True, "Created (New File)"
+
+        except GithubException as e:
+            # 🚨 [핵심] 409 Conflict (SHA 불일치) 발생 시 복구 로직
+            if e.status == 409:
+                print("⚠️ 409 Conflict 발생 -> 최신 SHA 재조회 후 1회 재시도")
+                # 해당 파일만 콕 집어서 최신 상태를 다시 가져옴
+                fresh_file = repo.get_contents(target_path_on_git, ref=gh_branch)
+                # 재시도
+                repo.update_file(target_path_on_git, commit_message, json_content, fresh_file.sha, branch=gh_branch)
+                return True, "Updated (After 409 Retry)"
+            else:
+                # 409 외의 다른 에러는 그대로 보고
+                raise e
 
     except Exception as e:
-        # 422 에러가 떴다는 건, 위 로직에도 불구하고 파일이 존재한다고 깃허브가 판단한 경우임
-        if "422" in str(e):
-            return False, f"⚠️ 파일명 충돌 발생 (422): 깃허브에 파일이 있지만 파이썬이 찾지 못했습니다. 파일명을 영어로 변경하는 것을 권장합니다.\n({e})"
         return False, str(e)
 # endregion
 
