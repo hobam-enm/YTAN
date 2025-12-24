@@ -1297,7 +1297,7 @@ def call_gemini_integrated(system_prompt, user_prompt):
             
     return "❌ AI 응답 생성 실패 (API 키 할당량 초과 또는 오류)"
 
-# [함수] UGC 영상 검색 (기간 필터 적용 + 중복 제외)
+# [함수] UGC 영상 검색 (기간 필터 + OST 제외 + 중복 제외)
 def search_ugc_videos(keyword, existing_ids, start_date=None, end_date=None, max_search=50):
     if not YT_PUBLIC_KEYS: return []
     
@@ -1321,21 +1321,25 @@ def search_ugc_videos(keyword, existing_ids, start_date=None, end_date=None, max
         # 키워드로 검색 (기간 필터 적용)
         search_res = youtube_pub.search().list(
             q=keyword, 
-            part="id", 
+            part="id,snippet", 
             type="video", 
             maxResults=max_search, 
             order="relevance",
-            publishedAfter=p_after,   # [적용]
-            publishedBefore=p_before  # [적용]
+            publishedAfter=p_after,
+            publishedBefore=p_before
         ).execute()
         
-        found_ids = [item['id']['videoId'] for item in search_res.get('items', [])]
-        
-        # 중복 제거 (기존 분석된 채널 영상 ID 제외)
         existing_set = set(existing_ids)
-        for vid in found_ids:
-            if vid not in existing_set:
-                ugc_ids.append(vid)
+        
+        for item in search_res.get('items', []):
+            vid = item['id']['videoId']
+            title = item['snippet']['title']
+            
+            # [필터링] 이미 수집된 영상이거나, 제목에 'OST'가 포함된 경우 제외
+            if vid in existing_set: continue
+            if "ost" in title.lower(): continue  # 대소문자 구분 없이 OST 제외
+            
+            ugc_ids.append(vid)
                 
     except Exception as e:
         # 검색 실패 시 조용히 넘김 (빈 리스트 반환)
@@ -1343,8 +1347,8 @@ def search_ugc_videos(keyword, existing_ids, start_date=None, end_date=None, max
         
     return ugc_ids
 
-# [함수] 댓글 수집 (간소화된 버전)
-def collect_comments_fast(video_ids, max_comments=2000):
+# [함수] 댓글 수집 (제한 대폭 완화)
+def collect_comments_fast(video_ids, max_comments=10000): # 기본값 10,000개로 상향
     if not YT_PUBLIC_KEYS or not video_ids: return ""
     
     youtube_pub = None
@@ -1358,12 +1362,11 @@ def collect_comments_fast(video_ids, max_comments=2000):
     comments = []
     total_collected = 0
     
-    # 빠른 수집을 위해 영상당 100개 제한, 최대 30개 영상만 샘플링
-    limit_per_video = 100 
-    
-    for vid in video_ids[:30]: 
+    # [수정] 영상 개수 제한(slice) 제거: 모든 영상을 순회
+    for vid in video_ids: 
         if total_collected >= max_comments: break
         try:
+            # 영상당 최대 100개씩 수집 (API 1회 호출 최대치)
             req = youtube_pub.commentThreads().list(
                 part="snippet", videoId=vid, maxResults=100, textFormat="plainText", order="relevance"
             )
@@ -1398,7 +1401,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
         st.caption("현재 분석된 데이터를 바탕으로 UGC(외부 반응)까지 포함하여 AI와 대화합니다.")
         
         if st.button("💬 AI와 대화하기 (UGC 포함)", type="primary"):
-            with st.spinner("🔄 외부 여론 수집 및 AI 분석 중입니다... (약 15~30초 소요)"):
+            with st.spinner("🔄 외부 여론 수집 및 AI 분석 중입니다... (데이터 양에 따라 시간이 소요될 수 있습니다)"):
                 # A. 데이터 준비
                 current_kw = st.session_state.get('analysis_keyword', '')
                 raw_results = st.session_state['analysis_raw_results']
@@ -1408,22 +1411,24 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 v_start = dates.get('start')
                 v_end = dates.get('end')
                 
-                # B. 채널 내 영상 ID 추출
+                # B. 채널 내 영상 ID 추출 (제한 없음!)
                 channel_vids = []
                 for ch in raw_results:
                     if 'top_video_stats' in ch:
                         channel_vids.extend([v['id'] for v in ch['top_video_stats']])
                 
-                # C. UGC(외부) 영상 추가 검색 (기간 필터 적용)
+                # C. UGC(외부) 영상 추가 검색 (기간 필터 + OST 제외 적용)
                 ugc_vids = search_ugc_videos(current_kw, channel_vids, start_date=v_start, end_date=v_end)
                 
-                # D. 댓글 수집 (채널 영상 일부 + UGC 영상 전체)
-                # 채널 영상은 상위 20개만, UGC는 검색된 것 전체 활용
-                target_vids = channel_vids[:20] + ugc_vids
-                collected_text = collect_comments_fast(target_vids)
+                # D. 댓글 수집 (채널 영상 전체 + UGC 영상 전체)
+                # [수정] 슬라이싱([:20]) 제거 -> 전체 리스트 사용
+                target_vids = channel_vids + ugc_vids
+                
+                # [수정] 넉넉하게 10,000개까지 수집 요청
+                collected_text = collect_comments_fast(target_vids, max_comments=10000)
                 st.session_state["chat_context_comments"] = collected_text
                 
-                # E. 프롬프트 구성 (파싱 과정 없이 바로 주입 + [수정] 테이블 구조 개선)
+                # E. 프롬프트 구성 (요청하신 내용 적용)
                 sys_prompt = (
                     "역할: 너는 엔터테인먼트/미디어 여론을 전문으로 분석하는 '수석 데이터 애널리스트'다.\n"
                     "목표: 제공된 댓글 데이터를 심층 분석하여 의사결정권자가 보기 편한 '인사이트 보고서'를 작성하라.\n"
@@ -1460,7 +1465,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 user_payload = (
                     f"분석 주제(키워드): {current_kw}\n"
                     f"분석 대상: {video_info_str}\n"
-                    f"댓글 데이터 샘플:\n{collected_text[:150000]}..." # [수정] 5만 -> 15만 상향
+                    f"댓글 데이터 샘플:\n{collected_text[:150000]}..." # 15만자 제한 (컨텍스트 윈도우 활용)
                 )
                 
                 # F. 첫 분석 실행
@@ -1515,7 +1520,7 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                     conversation_context += f"[{m['role']}]: {m['content']}\n"
 
                 payload_followup = (
-                    f"댓글 데이터:\n{context_comments[:150000]}\n\n" # [수정] 5만 -> 15만 상향
+                    f"댓글 데이터:\n{context_comments[:150000]}\n\n"
                     f"이전 대화:\n{conversation_context}\n\n"
                     f"사용자 질문: {prompt}"
                 )
