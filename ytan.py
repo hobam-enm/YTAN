@@ -1037,7 +1037,12 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
         if not keyword.strip(): st.error("⚠️ 분석 IP를 입력해주세요.")
         else:
-            # 1. 챗봇용 날짜 저장 (문자열 변환)
+            # ⬇️ [추가] 새 분석 시작 시 챗봇 상태 초기화 (대화 내용 삭제)
+            st.session_state["chat_active"] = False
+            st.session_state["chat_history"] = []
+            st.session_state["chat_context_comments"] = ""
+
+            # 1. 챗봇용 날짜 저장
             vs_str, ve_str = v_start.strftime("%Y-%m-%d"), v_end.strftime("%Y-%m-%d")
             st.session_state['analysis_dates'] = {'start': vs_str, 'end': ve_str}
             
@@ -1052,7 +1057,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 add_script_run_ctx(ctx=ctx)
                 return process_analysis_channel(cd, kw, vs, ve, ast, aet)
 
-            # [수정] worker에는 문자열(vs_str)이 아닌 날짜 객체(v_start)를 전달!
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
                 futures = {ex.submit(worker, ch, keyword, v_start, v_end, as_str, ae_str): ch for ch in data}
                 done = 0
@@ -1064,7 +1068,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
             prog_bar.empty()
             
-            # [수정] 결과가 0개일 때 처리 로직 추가
+            # 결과 저장 및 안내
             if ch_details_results:
                 st.session_state['analysis_raw_results'] = ch_details_results
                 st.session_state['analysis_keyword'] = keyword
@@ -1423,16 +1427,18 @@ if 'analysis_raw_results' in st.session_state and st.session_state['analysis_raw
                 sys_prompt = (
                     "역할: 너는 엔터테인먼트/미디어 여론을 전문으로 분석하는 '수석 데이터 애널리스트'다.\n"
                     "목표: 제공된 댓글 데이터를 심층 분석하여 의사결정권자가 보기 편한 '인사이트 보고서'를 작성하라.\n"
-                    "원칙: 모호한 표현(대체로 좋다 등)을 지양하고, 구체적인 키워드와 근거를 제시하라.\n\n"
+                    "원칙: 모호한 표현(대체로 좋다 등)을 지양하고, 구체적인 키워드와 근거를 제시하라.\n"
+                    "예외 규칙: OST관련 내용은 분석에서 제외하라.\n"
+                    "추가규칙1 : 근거 댓글을 인용할떄는 5개 이하로 (가장 요약내용에 적합한 것으로), 줄바꿈하여 보여줘야한다.\n"
                     "=== [필수 출력 포맷 (Markdown)] ===\n"
-                    "## 1. Executive Summary (3줄 요약)\n"
+                    "## 1. 3줄 요약\n"
                     "- (전체 여론의 핵심 흐름을 3개의 불렛포인트로 요약)\n\n"
-                    "## 2. 감성 점유율 (추정치)\n"
+                    "## 2. 감성 점유율\n"
                     "| 구분 | 비율 | 상세 분석 (요약 및 키워드) |\n"
                     "|---|---|---|\n"
-                    "| 긍정 | OO% | **[요약]** (예: 배우의 압도적인 연기력과 현실 고증에 대해 호평) <br> **[키워드]** 연기력, 현실성, 대본, 배우호감 |\n"
-                    "| 부정 | OO% | **[요약]** (예: 개연성 없는 전개와 원작 파괴에 대한 실망감) <br> **[키워드]** 개연성, 원작파괴, 지루함 |\n"
-                    "| 중립/논쟁 | OO% | **[요약]** (예: 실제 사건과의 연관성에 대한 분노 및 결말 해석 토론) <br> **[키워드]** 결말해석, 시즌2예측, 실제 사건 언급 |\n\n"
+                    "| 긍정 | OO% | **[요약]** (예: 배우의 압도적인 연기력과 현실 고증에 대해 호평)  **[키워드]** 연기력, 현실성, 대본, 배우호감 |\n"
+                    "| 부정 | OO% | **[요약]** (예: 개연성 없는 전개와 원작 파괴에 대한 실망감)  **[키워드]** 개연성, 원작파괴, 지루함 |\n"
+                    "| 중립/논쟁 | OO% | **[요약]** (예: 실제 사건과의 연관성에 대한 분노 및 결말 해석 토론)  **[키워드]** 결말해석, 시즌2예측, 실제 사건 언급 |\n\n"
                     "## 3. 핵심 토픽 분석 (Top 3)\n"
                     "### ① [토픽명 1]\n"
                     "- **반응**: (구체적인 여론 내용 서술)\n"
