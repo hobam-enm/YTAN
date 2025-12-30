@@ -1,0 +1,100 @@
+name: Sync PGC cache to YTCC
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      # 캐시가 루트에 있든, pgc_cache/에 있든 둘 다 트리거
+      - "cache_token_*.json"
+      - "pgc_cache/cache_token_*.json"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) YTAN 체크아웃
+      - name: Checkout YTAN
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 2) YTCC 체크아웃 (push 권한 필요)
+      - name: Checkout YTCC
+        uses: actions/checkout@v4
+        with:
+          repository: hobam-enm/YTCC_Archive
+          ref: main
+          token: ${{ secrets.YTCC_PAT }}
+          path: ytcc
+          fetch-depth: 1
+
+      # 3) YTAN에서 캐시 파일 목록 수집 (루트/pgc_cache 둘 다 지원)
+      - name: Collect cache files from YTAN
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p _cache_src
+          shopt -s nullglob
+
+          # 루트
+          for f in cache_token_*.json; do
+            cp -f "$f" "_cache_src/"
+          done
+
+          # pgc_cache 폴더
+          if [ -d "pgc_cache" ]; then
+            for f in pgc_cache/cache_token_*.json; do
+              cp -f "$f" "_cache_src/"
+            done
+          fi
+
+          COUNT=$(ls -1 _cache_src 2>/dev/null | wc -l | tr -d ' ')
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "❌ No cache_token_*.json found in YTAN (root or pgc_cache/)."
+            exit 1
+          fi
+
+          echo "✅ Found $COUNT cache file(s)."
+
+      # 4) YTCC의 pgc_cache/를 “미러링”(삭제 후 동일화)
+      - name: Mirror into YTCC/pgc_cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ytcc/pgc_cache
+
+          # 기존 캐시 삭제(미러링)
+          rm -f ytcc/pgc_cache/cache_token_*.json
+
+          # 복사
+          cp -f _cache_src/cache_token_*.json ytcc/pgc_cache/
+
+          # 변경분 확인
+          cd ytcc
+          git status --porcelain
+          cd -
+
+      # 5) 변경 있을 때만 커밋/푸시
+      - name: Commit & push if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ytcc
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "✅ No changes to commit."
+            exit 0
+          fi
+
+          git config user.name  "ytan-cache-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          git add pgc_cache/cache_token_*.json
+          git commit -m "Sync PGC cache from YTAN @ ${GITHUB_SHA}"
+          git push origin main
