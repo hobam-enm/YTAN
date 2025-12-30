@@ -397,73 +397,145 @@ def parse_duration_to_minutes(duration_str):
     total_sec = (int(h or 0) * 3600) + (int(m or 0) * 60) + (int(s or 0))
     return round(total_sec / 60, 1)
 
-# [수정] Github 업로드 함수 (한글 자모 분리 + 409 충돌 자동 복구)
+# [수정] Github 업로드 함수 (한글 자모 분리 + 409 충돌 자동 복구 + 다회 재시도)
 def upload_to_github(file_path, content_list):
     """
     로컬 캐시 데이터를 GitHub에 저장합니다.
-    1. 한글 자모 분리(NFC/NFD) 문제 해결
-    2. 409 Conflict(SHA 불일치) 발생 시 자동 재시도
+
+    ✅ 개선 포인트
+    1) 한글 자모 분리(NFC/NFD) 문제 대응(경로 정규화 비교)
+    2) 409 Conflict(SHA 불일치) 발생 시: 최신 SHA 재조회 + 다회 재시도(백오프)
+    3) 422(이미 존재/유효성) 등 경합 상황도 흡수(create↔update 전환)
+    4) 동일 파일 경로 업로드는 프로세스 내부에서 직렬화(락)하여 409 빈도 감소
     """
     import unicodedata
+    import threading
+    import random
 
-    def normalize_str(s):
-        return unicodedata.normalize('NFC', s) if s else ""
+    def _nfc(s: str) -> str:
+        return unicodedata.normalize("NFC", s) if s else ""
 
-    try:
-        if "github" not in st.secrets: 
-            return False, "설정 오류: secrets.toml에 [github] 섹션이 없습니다."
-        
-        gh_token = st.secrets["github"]["token"]
-        gh_repo = st.secrets["github"]["repo_name"]
-        gh_branch = st.secrets["github"]["branch"]
+    # ✅ 프로세스 내 파일별 업로드 락 (Streamlit/ThreadPool 동시 실행 완화)
+    guard = globals().setdefault("_GITHUB_UPLOAD_LOCKS_GUARD", threading.Lock())
+    lock_map = globals().setdefault("_GITHUB_UPLOAD_LOCKS", {})
+    lock_key = _nfc(str(file_path))
 
-        g = Github(gh_token)
-        repo = g.get_repo(gh_repo)
-        
-        json_content = json.dumps(content_list, ensure_ascii=False, indent=2)
-        commit_message = f"Update cache: {file_path} (via Streamlit App)"
-        
-        # 1. 저장소의 모든 파일 목록 가져오기 (파일명 정규화 비교를 위해)
-        contents = repo.get_contents("", ref=gh_branch)
-        
-        target_sha = None
-        target_path_on_git = file_path # 기본값은 로컬 파일명
-        
-        # 2. 정규화된 이름으로 파일 찾기
-        search_name = normalize_str(file_path)
-        for c in contents:
-            if normalize_str(c.path) == search_name:
-                target_sha = c.sha
-                target_path_on_git = c.path # 깃허브 실존 경로
-                break
-        
-        # 3. 저장 시도 (재시도 로직 포함)
+    with guard:
+        file_lock = lock_map.setdefault(lock_key, threading.Lock())
+
+    with file_lock:
         try:
-            if target_sha:
-                # 수정 (Update)
-                repo.update_file(target_path_on_git, commit_message, json_content, target_sha, branch=gh_branch)
-                return True, "Updated (SHA Found)"
-            else:
-                # 생성 (Create)
-                repo.create_file(file_path, commit_message, json_content, branch=gh_branch)
-                return True, "Created (New File)"
+            if "github" not in st.secrets:
+                return False, "설정 오류: secrets.toml에 [github] 섹션이 없습니다."
 
-        except GithubException as e:
-            # 🚨 [핵심] 409 Conflict (SHA 불일치) 발생 시 복구 로직
-            if e.status == 409:
-                print("⚠️ 409 Conflict 발생 -> 최신 SHA 재조회 후 1회 재시도")
-                # 해당 파일만 콕 집어서 최신 상태를 다시 가져옴
-                fresh_file = repo.get_contents(target_path_on_git, ref=gh_branch)
-                # 재시도
-                repo.update_file(target_path_on_git, commit_message, json_content, fresh_file.sha, branch=gh_branch)
-                return True, "Updated (After 409 Retry)"
-            else:
-                # 409 외의 다른 에러는 그대로 보고
-                raise e
+            gh_token = st.secrets["github"]["token"]
+            gh_repo = st.secrets["github"]["repo_name"]
+            gh_branch = st.secrets["github"]["branch"]
 
-    except Exception as e:
-        return False, str(e)
+            g = Github(gh_token)
+            repo = g.get_repo(gh_repo)
+
+            json_content = json.dumps(content_list, ensure_ascii=False, indent=2)
+            commit_message = f"Update cache: {file_path} (via Streamlit App)"
+
+            # ----------------------------------------------------------
+            # (A) GitHub에 존재하는 실제 경로/sha 찾기 (NFC/NFD 대응 포함)
+            # ----------------------------------------------------------
+            target_path_on_git = str(file_path)
+            search_name = _nfc(str(file_path))
+
+            def _try_resolve_path_via_listing():
+                """404가 났을 때, 동일 디렉토리 내에서 NFC로 경로를 찾아본다."""
+                # file_path가 "dir/file.json" 형태면 dir만 리스트
+                dir_path = os.path.dirname(target_path_on_git).replace("\\", "/")
+                if dir_path == ".":
+                    dir_path = ""
+                try:
+                    items = repo.get_contents(dir_path, ref=gh_branch)
+                except GithubException:
+                    return None, None
+
+                # get_contents는 단일 파일이면 객체, 폴더면 list
+                if not isinstance(items, list):
+                    items = [items]
+
+                for c in items:
+                    if _nfc(c.path) == search_name:
+                        return c.path, c.sha
+                return None, None
+
+            # 1) 우선: "내가 가진 경로"로 직접 조회 (가장 정확/빠름)
+            target_sha = None
+            try:
+                cur = repo.get_contents(target_path_on_git, ref=gh_branch)
+                target_path_on_git = cur.path
+                target_sha = cur.sha
+            except GithubException as e:
+                if e.status != 404:
+                    raise
+                # 2) 404면: NFC 정규화 비교로 동일 경로 탐색(한글 자모 분리 대응)
+                found_path, found_sha = _try_resolve_path_via_listing()
+                if found_path:
+                    target_path_on_git = found_path
+                    target_sha = found_sha
+                else:
+                    target_sha = None
+
+            # ----------------------------------------------------------
+            # (B) Create/Update (409/422 포함) 다회 재시도 + 백오프
+            # ----------------------------------------------------------
+            MAX_RETRY = 5
+            for attempt in range(1, MAX_RETRY + 1):
+                try:
+                    if target_sha:
+                        # ✅ Update: 매 시도마다 최신 sha 재확인(409 대비)
+                        cur = repo.get_contents(target_path_on_git, ref=gh_branch)
+                        repo.update_file(cur.path, commit_message, json_content, cur.sha, branch=gh_branch)
+                        return True, f"Updated (attempt {attempt})"
+
+                    # ✅ Create
+                    repo.create_file(target_path_on_git, commit_message, json_content, branch=gh_branch)
+                    return True, f"Created (attempt {attempt})"
+
+                except GithubException as e:
+                    # 409: SHA mismatch (동시 업데이트/경합) → 백오프 후 재시도
+                    if e.status == 409:
+                        sleep_s = min(2.0, 0.2 * (2 ** (attempt - 1))) + random.random() * 0.12
+                        time.sleep(sleep_s)
+                        # 다음 루프에서 최신 sha를 다시 읽어 update 시도
+                        target_sha = True  # 플래그 역할(실제 sha는 다음 get_contents에서)
+                        continue
+
+                    # 422: create 경합(이미 누가 생성) 혹은 유효성 에러
+                    # - 이미 생성된 케이스는 update로 전환해 흡수
+                    if e.status == 422:
+                        sleep_s = 0.15 + random.random() * 0.12
+                        time.sleep(sleep_s)
+                        try:
+                            cur = repo.get_contents(target_path_on_git, ref=gh_branch)
+                            target_path_on_git = cur.path
+                            target_sha = cur.sha
+                        except GithubException:
+                            # 여전히 못 찾으면 다음 루프로
+                            pass
+                        continue
+
+                    # 404: 중간에 파일이 사라진 케이스 → create로 전환
+                    if e.status == 404:
+                        target_sha = None
+                        continue
+
+                    return False, f"{e.status} {getattr(e, 'data', '')}"
+
+                except Exception as e:
+                    return False, str(e)
+
+            return False, f"409/422 경합으로 {MAX_RETRY}회 재시도 후 실패"
+
+        except Exception as e:
+            return False, str(e)
 # endregion
+
 
 # region [2-X. 대화 저장(Export) 유틸 (Chat Export Utilities)]
 # ==========================================
