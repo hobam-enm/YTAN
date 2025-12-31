@@ -63,6 +63,7 @@ jobs:
           TARGET_REPOS=(
             "hobam-enm/-TEST-YTCC-chatbot"
             "hobam-enm/YTCC-chatbot"
+            "hobam-enm/-TEST222-Chatbot"
           )
 
           for REPO in "${TARGET_REPOS[@]}"; do
