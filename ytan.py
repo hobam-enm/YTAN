@@ -31,11 +31,47 @@ from github import Github, GithubException # PyGithub
 
 # region [1. 설정 및 상수 (Config & Constants)]
 # ==========================================
+import streamlit as st
+import os
+import glob
+import json
+import time
+import re
+import hashlib
+import datetime
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+import google.oauth2.credentials
+import googleapiclient.discovery
+import google.auth.transport.requests
+import extra_streamlit_components as stx 
+import google.generativeai as genai
+from googleapiclient.errors import HttpError
+import html
+import html as _html
+from pathlib import Path
+from streamlit.components.v1 import html as st_html
+
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+from datetime import datetime, timedelta
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import firestore
+
+# [추가] 스케줄러 라이브러리
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
+
+# [변경] 사이드바 기본 상태: 'collapsed' (접힘)
 st.set_page_config(
     page_title="Drama YouTube Insight", 
     page_icon="📊",
     layout="wide", 
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed" 
 )
 # endregion
 
@@ -354,7 +390,7 @@ def parse_duration_to_minutes(duration_str):
     return round(total_sec / 60, 1)
 
 # ==========================================
-# [수정] Firebase 저장 (이중 제한 해결 버전)
+# [수정] Firebase 저장 + 캐싱(25시간) + 시간확인
 # ==========================================
 def init_firebase():
     try:
@@ -370,28 +406,22 @@ def init_firebase():
         return None
 
 def save_to_firebase(file_name, content_list):
-    """
-    1. 문서 1개당 1MB 제한 -> 40개씩 쪼개기 (약 0.9MB)
-    2. 전송 1번당 10MB 제한 -> 10묶음씩만 모아서 전송 (약 9MB)
-    """
     try:
         db = init_firebase()
         if not db: return False, "Secrets 설정 오류 또는 DB 연결 실패"
 
         doc_ref = db.collection('yt_cache').document(file_name)
         
-        # 기존 청크 삭제
         old_chunks = doc_ref.collection('chunks').stream()
         for doc in old_chunks:
             doc.reference.delete()
 
-        # [튜닝] 40개: 문서당 1MB 안 넘기는 안전한 숫자
         CHUNK_SIZE = 40 
         total_videos = len(content_list)
         
         doc_ref.set({
             'total_count': total_videos,
-            'updated_at': firestore.SERVER_TIMESTAMP
+            'updated_at': firestore.SERVER_TIMESTAMP # 서버 시간 저장
         })
 
         batch = db.batch()
@@ -406,8 +436,6 @@ def save_to_firebase(file_name, content_list):
             
             batch_count += 1
             
-            # [튜닝] 10개 묶음마다 전송 (40개 * 10 = 400개 데이터)
-            # 총 용량 약 9MB로 맞춰서 10MB 제한 회피
             if batch_count >= 10:
                 batch.commit()
                 batch = db.batch()
@@ -416,11 +444,17 @@ def save_to_firebase(file_name, content_list):
         if batch_count > 0:
             batch.commit()
             
+        # [중요] 저장 후 캐시 비우기 (다음 호출 시 새 데이터 로딩)
+        load_from_firebase.clear()
+        get_last_update_time.clear() # 시간 정보도 갱신
+        
         return True, f"Firebase Saved ({total_videos} items)"
 
     except Exception as e:
         return False, str(e)
 
+# [설정] 25시간 유지 (90000초)
+@st.cache_data(ttl=90000, show_spinner=False)
 def load_from_firebase(file_name):
     try:
         db = init_firebase()
@@ -432,8 +466,6 @@ def load_from_firebase(file_name):
             return []
 
         chunks_stream = doc_ref.collection('chunks').stream()
-        
-        # ID 정렬
         sorted_chunks = sorted(chunks_stream, key=lambda x: int(x.id) if x.id.isdigit() else x.id)
         
         all_videos = []
@@ -446,6 +478,25 @@ def load_from_firebase(file_name):
     except Exception as e:
         print(f"Load Error: {e}")
         return []
+
+# [추가] 마지막 업데이트 시간만 가볍게 가져오는 함수
+@st.cache_data(ttl=90000, show_spinner=False)
+def get_last_update_time(file_name):
+    try:
+        db = init_firebase()
+        if not db: return None
+        doc = db.collection('yt_cache').document(file_name).get()
+        if doc.exists:
+            data = doc.to_dict()
+            if 'updated_at' in data:
+                # Firestore Timestamp를 한국 시간 문자열로 변환
+                ts = data['updated_at']
+                dt_utc = ts.replace(tzinfo=None) # naive remove
+                dt_kst = dt_utc + timedelta(hours=9)
+                return dt_kst.strftime("%Y-%m-%d %H:%M")
+        return None
+    except:
+        return None
 # endregion
 
 
@@ -810,6 +861,16 @@ def get_creds_from_file(token_filename):
     return creds
 
 def process_sync_channel(token_file, limit_date, status_box, force_rescan):
+    # [추가] DummyBox: 자동 실행 시 UI 에러 방지
+    if status_box is None:
+        class DummyBox:
+            def success(self, m): pass
+            def error(self, m): print(f"[Error] {m}")
+            def warning(self, m): pass
+            def info(self, m): pass
+            def markdown(self, m): pass
+        status_box = DummyBox()
+
     file_label = os.path.basename(token_file).replace("token_", "").replace(".json", "")
     creds = get_creds_from_file(token_file)
     if not creds: 
@@ -871,8 +932,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             with open(cache_file, 'w', encoding='utf-8') as f: 
                 json.dump(final_list, f, ensure_ascii=False, indent=2)
             
-            # [변경] 파이어베이스 저장 (청크 분할 방식 적용)
-            # 캐시 파일명(cache_token_xxx.json)을 문서 ID로 사용
+            # 파이어베이스 저장
             is_ok, msg = save_to_firebase(os.path.basename(cache_file), final_list)
             
             if is_ok:
@@ -888,7 +948,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         return {'error': str(e)}
 
 def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_start, anl_end):
-    # (기존 로직과 동일 - 생략 없이 그대로 유지)
+    # (기존 분석 로직과 동일)
     creds = channel_data['creds']; videos = channel_data['videos']
     norm_keyword = normalize_text(keyword)
     target_ids = []
@@ -1066,6 +1126,38 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         'top_video_stats': top_video_stats,
         'over_1m_count': over_1m_count 
     }
+
+# ==========================================
+# [추가] 자동 스케줄러 (매일 아침 9시)
+# ==========================================
+def job_auto_update_data():
+    print(f"⏰ [Auto-Update] 자동 수집 시작: {datetime.now()}")
+    token_files = glob.glob("token_*.json")
+    if not token_files:
+        print("❌ 토큰 파일 없음")
+        return
+
+    try:
+        for tf in token_files:
+            process_sync_channel(tf, DEFAULT_LIMIT_DATE, None, False)
+            print(f"✅ [Auto-Update] 완료: {tf}")
+        
+        load_from_firebase.clear()
+        get_last_update_time.clear()
+        
+    except Exception as e:
+        print(f"⚠️ [Auto-Update] 에러 발생: {e}")
+
+@st.cache_resource
+def init_scheduler():
+    scheduler = BackgroundScheduler()
+    korea_tz = pytz.timezone('Asia/Seoul')
+    trigger = CronTrigger(hour=9, minute=0, timezone=korea_tz)
+    scheduler.add_job(job_auto_update_data, trigger)
+    scheduler.start()
+    print("🚀 [Scheduler] 스케줄러가 시작되었습니다. (매일 09:00 KST)")
+
+init_scheduler()
 # endregion
 
 
@@ -1076,73 +1168,138 @@ st.title("📊 Drama YouTube Insight")
 # --- 사이드바 ---
 with st.sidebar:
     st.header("🎛️ 데이터 관리 센터")
-    token_files = glob.glob("token_*.json")
-    st.markdown("---")
-    st.caption("데이터 동기화")
-    if st.button("🔄 최신 영상 업데이트", type="primary", use_container_width=True):
-        if not token_files: st.error("연동된 토큰 파일이 없습니다.")
-        else:
-            st.session_state['channels_data'] = []
-            st.write("--- 업데이트 진행 중 ---")
-            placeholders = {tf: st.empty() for tf in token_files}
-            ready = []
-            ctx = get_script_run_ctx()
-            def sync_worker(tf, sb):
-                add_script_run_ctx(ctx=ctx)
-                return process_sync_channel(tf, DEFAULT_LIMIT_DATE, sb, False)
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                futs = {ex.submit(sync_worker, tf, placeholders[tf]): tf for tf in token_files}
-                for f in as_completed(futs):
-                    res = f.result()
-                    if res and 'name' in res: ready.append(res)
-            st.session_state['channels_data'] = ready
-            if ready: st.success("업데이트 완료!")
-            
-    st.markdown("---")
-    with st.expander("🔒 고급 관리자 설정"):
-        if 'admin_unlocked' not in st.session_state: st.session_state['admin_unlocked'] = False
-        if not st.session_state['admin_unlocked']:
-            if st.text_input("비밀번호", type="password", key="pw_input") == "dima1234":
-                st.session_state['admin_unlocked'] = True
+    
+    # [보안] 관리자 비밀번호 입력 로직
+    if 'admin_auth' not in st.session_state: st.session_state['admin_auth'] = False
+    
+    if not st.session_state['admin_auth']:
+        st.caption("🔒 관계자 전용 메뉴입니다.")
+        admin_pw = st.text_input("관리자 비밀번호", type="password", key="sidebar_pw")
+        if admin_pw:
+            # secrets.toml 의 [admin] 섹션에서 비밀번호 가져오기
+            correct_pw = st.secrets.get("admin", {}).get("password", "")
+            if admin_pw == correct_pw:
+                st.session_state['admin_auth'] = True
                 st.rerun()
-        if st.session_state['admin_unlocked']:
-            st.success("✅ 관리자 모드 On")
-            l_date = st.date_input("수집 마지노선", value=pd.to_datetime(DEFAULT_LIMIT_DATE))
-            if st.button("🚨 전체 재수집", type="secondary"):
+            else:
+                st.error("비밀번호 불일치")
+    
+    # [보안 통과 후] 메뉴 표시
+    if st.session_state['admin_auth']:
+        token_files = glob.glob("token_*.json")
+        st.markdown("---")
+        
+        # [추가] 마지막 업데이트 시간 표시 (토큰 파일 중 첫 번째 기준)
+        if token_files:
+             last_time_str = get_last_update_time(f"cache_{os.path.basename(token_files[0])}")
+             if last_time_str:
+                 st.info(f"🕒 최근 업데이트: {last_time_str}")
+             else:
+                 st.caption("업데이트 기록 없음")
+        
+        st.caption("데이터 동기화")
+        if st.button("🔄 최신 영상 업데이트 (수동)", type="primary", use_container_width=True):
+            if not token_files: st.error("연동된 토큰 파일이 없습니다.")
+            else:
                 st.session_state['channels_data'] = []
+                st.write("--- 업데이트 진행 중 ---")
                 placeholders = {tf: st.empty() for tf in token_files}
                 ready = []
                 ctx = get_script_run_ctx()
-                def deep_worker(tf, sb):
+                def sync_worker(tf, sb):
                     add_script_run_ctx(ctx=ctx)
-                    return process_sync_channel(tf, l_date.strftime("%Y-%m-%d"), sb, True)
+                    return process_sync_channel(tf, DEFAULT_LIMIT_DATE, sb, False)
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                    futs = {ex.submit(deep_worker, tf, placeholders[tf]): tf for tf in token_files}
+                    futs = {ex.submit(sync_worker, tf, placeholders[tf]): tf for tf in token_files}
                     for f in as_completed(futs):
                         res = f.result()
                         if res and 'name' in res: ready.append(res)
                 st.session_state['channels_data'] = ready
-                if ready: st.success("완료!")
-            if st.button("🔒 잠금"):
-                st.session_state['admin_unlocked'] = False
-                st.rerun()
+                if ready: 
+                    st.success("업데이트 완료!")
+                    # 시간 갱신을 위해 캐시 삭제 후 리런
+                    load_from_firebase.clear()
+                    get_last_update_time.clear()
+                    time.sleep(1)
+                    st.rerun()
+                
+        st.markdown("---")
+        
+        # [변경] 메뉴 이름 수정 (헷갈림 방지)
+        with st.expander("⚠️ DB 초기화 및 전체 재수집 (Admin)"):
+            if 'admin_unlocked' not in st.session_state: st.session_state['admin_unlocked'] = False
+            
+            # 여기서도 이중 잠금 (기존 유지)
+            if not st.session_state['admin_unlocked']:
+                st.caption("정말 전체 데이터를 갈아엎으시겠습니까?")
+                if st.text_input("2차 비밀번호", type="password", key="pw_input") == "dima1234":
+                    st.session_state['admin_unlocked'] = True
+                    st.rerun()
+                    
+            if st.session_state['admin_unlocked']:
+                st.error("🚨 주의: 매우 오래 걸립니다.")
+                l_date = st.date_input("수집 마지노선", value=pd.to_datetime(DEFAULT_LIMIT_DATE))
+                if st.button("🔥 전체 데이터 덮어쓰기 (실행)", type="secondary"):
+                    st.session_state['channels_data'] = []
+                    placeholders = {tf: st.empty() for tf in token_files}
+                    ready = []
+                    ctx = get_script_run_ctx()
+                    def deep_worker(tf, sb):
+                        add_script_run_ctx(ctx=ctx)
+                        return process_sync_channel(tf, l_date.strftime("%Y-%m-%d"), sb, True)
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                        futs = {ex.submit(deep_worker, tf, placeholders[tf]): tf for tf in token_files}
+                        for f in as_completed(futs):
+                            res = f.result()
+                            if res and 'name' in res: ready.append(res)
+                    st.session_state['channels_data'] = ready
+                    if ready: 
+                        st.success("완료!")
+                        load_from_firebase.clear()
+                        get_last_update_time.clear()
+                        time.sleep(1)
+                        st.rerun()
+                if st.button("🔒 잠금"):
+                    st.session_state['admin_unlocked'] = False
+                    st.rerun()
+    
+    # [추가] 로그아웃 버튼 (선택사항)
+    if st.session_state['admin_auth']:
+         if st.button("로그아웃", use_container_width=True):
+             st.session_state['admin_auth'] = False
+             st.rerun()
 
 # --- 메인 ---
 if 'channels_data' not in st.session_state or not st.session_state['channels_data']:
     token_files = glob.glob("token_*.json")
     temp_data = []
+    
+    # [변경] 로컬 파일 대신 Firebase(캐시)에서 먼저 로드 시도
+    # 토큰 파일 이름을 기반으로 Firebase 캐시 파일명 추론
     for tf in token_files:
-        cf = f"cache_{tf}"
-        if os.path.exists(cf):
-             with open(cf, 'r', encoding='utf-8') as f:
-                try:
-                    vids = json.load(f); creds = get_creds_from_file(tf)
-                    if creds:
-                        lbl = os.path.basename(tf).replace("token_", "").replace(".json", "")
-                        temp_data.append({'creds': creds, 'name': lbl, 'videos': vids})
-                except: pass
+        cache_name = f"cache_{os.path.basename(tf)}"
+        
+        # 1. Firebase에서 가져오기 (캐싱 적용됨)
+        vids = load_from_firebase(cache_name)
+        
+        if vids:
+             creds = get_creds_from_file(tf)
+             if creds:
+                 lbl = os.path.basename(tf).replace("token_", "").replace(".json", "")
+                 temp_data.append({'creds': creds, 'name': lbl, 'videos': vids})
+        else:
+            # 2. Firebase 실패 시 로컬 백업 확인 (기존 로직)
+            if os.path.exists(cache_name):
+                 with open(cache_name, 'r', encoding='utf-8') as f:
+                    try:
+                        vids = json.load(f); creds = get_creds_from_file(tf)
+                        if creds:
+                            lbl = os.path.basename(tf).replace("token_", "").replace(".json", "")
+                            temp_data.append({'creds': creds, 'name': lbl, 'videos': vids})
+                    except: pass
+                    
     if temp_data: st.session_state['channels_data'] = temp_data
-    else: st.info("👋 환영합니다! 사이드바에서 [최신 영상 업데이트]를 먼저 진행해주세요.")
+    else: st.info("👋 데이터 준비 중... 잠시만 기다려주세요 (자동 수집 대기 중)")
 
 if 'channels_data' in st.session_state and st.session_state['channels_data']:
     data = st.session_state['channels_data']
@@ -1177,16 +1334,13 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
         if not keyword.strip(): st.error("⚠️ 분석 IP를 입력해주세요.")
         else:
-            # ⬇️ [추가] 새 분석 시작 시 챗봇 상태 초기화 (대화 내용 삭제)
             st.session_state["chat_active"] = False
             st.session_state["chat_history"] = []
             st.session_state["chat_context_comments"] = ""
 
-            # 1. 챗봇용 날짜 저장
             vs_str, ve_str = v_start.strftime("%Y-%m-%d"), v_end.strftime("%Y-%m-%d")
             st.session_state['analysis_dates'] = {'start': vs_str, 'end': ve_str}
             
-            # 2. 분석용 날짜 준비
             as_str = a_start.strftime("%Y-%m-%d"); ae_str = a_end.strftime("%Y-%m-%d")
             
             prog_bar = st.progress(0, text="데이터 분석 중...")
@@ -1208,7 +1362,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
             prog_bar.empty()
             
-            # 결과 저장 및 안내
             if ch_details_results:
                 st.session_state['analysis_raw_results'] = ch_details_results
                 st.session_state['analysis_keyword'] = keyword
@@ -1303,7 +1456,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
             fig_trend = get_daily_trend_chart(final_daily, recent_gap)
             if fig_trend:
-                st.markdown("##### 📈 일별 조회수 추이 )")
+                st.markdown("##### 📈 일별 조회수 추이")
                 with st.container(border=True):
                     st.plotly_chart(fig_trend, use_container_width=True)
                 st.write("")
@@ -1317,7 +1470,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                     top_vids = sorted(deduped_vids, key=lambda x: x['period_views'], reverse=True)[:100]
                     
                     df_top = pd.DataFrame(top_vids)
-                    df_top['link'] = df_top['id'].apply(lambda x: f"https://youtu.be/{x}")
+                    df_top['link'] = df_top['id'].apply(lambda x: f"[https://youtu.be/](https://youtu.be/){x}")
                     
                     df_show = df_top[['title', 'period_views', 'avg_pct', 'period_likes', 'link']].copy()
                     df_show.columns = ['제목', '조회수', '지속률(%)', '좋아요', '바로가기']
@@ -1376,18 +1529,12 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
             fig_map = get_country_map(final_country)
             if fig_map:
-                # [수정] 화면을 반으로 나누기 (1:1 비율)
                 c_map1, c_map2 = st.columns(2)
-
-                # 왼쪽 컬럼에만 지도 배치
                 with c_map1:
                     st.markdown("##### 🌍 글로벌 조회수 분포")
                     with st.container(border=True):
                         st.plotly_chart(fig_map, use_container_width=True)
-                
-                # 오른쪽(c_map2)은 비워둠 -> 결과적으로 지도가 화면 절반 크기가 됨
                 st.write("")
-
 
         else:
             st.warning("⚠️ 검색 결과가 없습니다.")
