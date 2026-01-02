@@ -24,6 +24,9 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 from datetime import datetime, timedelta
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import firestore
 from github import Github, GithubException # PyGithub
 
 # region [1. 설정 및 상수 (Config & Constants)]
@@ -255,7 +258,7 @@ PROMPT_FILE_1ST = "1차 질문 프롬프트.md"
 
 def extract_report_html(text: str) -> str | None:
     """
-    모델 응답에서 <!--REPORT_START--> ~ <!--REPORT_END--> 구간만 뽑아서
+    모델 응답에서 ~ 구간만 뽑아서
     '진짜 HTML'로 정리해 반환. 없으면 None.
     - 중간에 ```html / ``` 코드펜스가 섞여도 제거
     - 들여쓰기(마크다운 코드블록 유발) 제거
@@ -263,8 +266,8 @@ def extract_report_html(text: str) -> str | None:
     """
     raw = (text or "")
 
-    start = "<!--REPORT_START-->"
-    end = "<!--REPORT_END-->"
+    start = ""
+    end = ""
     if start not in raw or end not in raw:
         return None
 
@@ -397,143 +400,111 @@ def parse_duration_to_minutes(duration_str):
     total_sec = (int(h or 0) * 3600) + (int(m or 0) * 60) + (int(s or 0))
     return round(total_sec / 60, 1)
 
-# [수정] Github 업로드 함수 (한글 자모 분리 + 409 충돌 자동 복구 + 다회 재시도)
-def upload_to_github(file_path, content_list):
+# ==========================================
+# [변경] Firebase 연동 및 데이터 청크(Chunk) 처리 로직
+# ==========================================
+def init_firebase():
+    """파이어베이스 앱 초기화 (싱글톤 패턴)"""
+    try:
+        if not firebase_admin._apps:
+            if "firebase" not in st.secrets:
+                return None
+            cred_dict = dict(st.secrets["firebase"])
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception as e:
+        print(f"Firebase Init Error: {e}")
+        return None
+
+def save_to_firebase(file_name, content_list):
     """
-    로컬 캐시 데이터를 GitHub에 저장합니다.
-
-    ✅ 개선 포인트
-    1) 한글 자모 분리(NFC/NFD) 문제 대응(경로 정규화 비교)
-    2) 409 Conflict(SHA 불일치) 발생 시: 최신 SHA 재조회 + 다회 재시도(백오프)
-    3) 422(이미 존재/유효성) 등 경합 상황도 흡수(create↔update 전환)
-    4) 동일 파일 경로 업로드는 프로세스 내부에서 직렬화(락)하여 409 빈도 감소
+    1MB 제한을 피하기 위해 리스트를 500개씩 쪼개서 서브컬렉션에 저장합니다.
+    구조: yt_cache (컬렉션) -> 파일명 (문서) -> chunks (서브컬렉션) -> 0, 1, 2... (문서)
     """
-    import unicodedata
-    import threading
-    import random
+    try:
+        db = init_firebase()
+        if not db: return False, "Secrets 설정 오류 또는 DB 연결 실패"
 
-    def _nfc(s: str) -> str:
-        return unicodedata.normalize("NFC", s) if s else ""
+        # 1. 메인 문서 레퍼런스
+        doc_ref = db.collection('yt_cache').document(file_name)
+        
+        # 2. 기존 청크 데이터 정리 (덮어쓰기 위해)
+        # (주의: 청크 양이 매우 많으면 배치 삭제 로직이 필요하나, 보통 10~20개 내외라 stream 삭제 사용)
+        old_chunks = doc_ref.collection('chunks').stream()
+        for doc in old_chunks:
+            doc.reference.delete()
 
-    # ✅ 프로세스 내 파일별 업로드 락 (Streamlit/ThreadPool 동시 실행 완화)
-    guard = globals().setdefault("_GITHUB_UPLOAD_LOCKS_GUARD", threading.Lock())
-    lock_map = globals().setdefault("_GITHUB_UPLOAD_LOCKS", {})
-    lock_key = _nfc(str(file_path))
+        # 3. 데이터 쪼개기 (Chunking) - 안전하게 500개 단위
+        CHUNK_SIZE = 500
+        total_videos = len(content_list)
+        
+        # 메인 문서에는 요약 정보만 기록 (가벼움)
+        doc_ref.set({
+            'total_count': total_videos,
+            'updated_at': firestore.SERVER_TIMESTAMP
+        })
 
-    with guard:
-        file_lock = lock_map.setdefault(lock_key, threading.Lock())
+        # 4. 조각내서 저장 (Batch Write로 속도 향상)
+        batch = db.batch()
+        batch_count = 0
+        
+        for i in range(0, total_videos, CHUNK_SIZE):
+            chunk = content_list[i : i + CHUNK_SIZE]
+            chunk_index = str(i // CHUNK_SIZE) # 문서 ID: 0, 1, 2...
+            
+            # 서브컬렉션 'chunks'에 저장
+            chunk_ref = doc_ref.collection('chunks').document(chunk_index)
+            batch.set(chunk_ref, {'data': chunk})
+            
+            batch_count += 1
+            # Firestore 배치는 최대 500개 작업까지만 가능하므로 400개마다 커밋
+            if batch_count >= 400:
+                batch.commit()
+                batch = db.batch() # 배치 초기화
+                batch_count = 0
+        
+        # 남은 작업 커밋
+        if batch_count > 0:
+            batch.commit()
+            
+        return True, f"Firebase Saved ({total_videos} items)"
 
-    with file_lock:
-        try:
-            if "github" not in st.secrets:
-                return False, "설정 오류: secrets.toml에 [github] 섹션이 없습니다."
+    except Exception as e:
+        return False, str(e)
 
-            gh_token = st.secrets["github"]["token"]
-            gh_repo = st.secrets["github"]["repo_name"]
-            gh_branch = st.secrets["github"]["branch"]
+def load_from_firebase(file_name):
+    """
+    조각난(Chunked) 데이터를 모두 가져와서 하나의 리스트로 합칩니다.
+    """
+    try:
+        db = init_firebase()
+        if not db: return []
 
-            g = Github(gh_token)
-            repo = g.get_repo(gh_repo)
+        doc_ref = db.collection('yt_cache').document(file_name)
+        
+        # 메인 문서 존재 확인
+        main_doc = doc_ref.get()
+        if not main_doc.exists:
+            return []
 
-            json_content = json.dumps(content_list, ensure_ascii=False, indent=2)
-            commit_message = f"Update cache: {file_path} (via Streamlit App)"
+        # 서브컬렉션 'chunks'에서 모든 조각 가져오기
+        chunks_stream = doc_ref.collection('chunks').stream()
+        
+        all_videos = []
+        # 문서 ID(0, 1, 2...) 순서대로 정렬 (문자열 정렬 주의: 10이 2보다 앞에 오지 않게 int 변환)
+        # 문서 ID가 숫자형 문자열이라고 가정
+        sorted_chunks = sorted(chunks_stream, key=lambda x: int(x.id) if x.id.isdigit() else x.id)
+        
+        for chunk_doc in sorted_chunks:
+            chunk_data = chunk_doc.to_dict().get('data', [])
+            all_videos.extend(chunk_data)
+            
+        return all_videos
 
-            # ----------------------------------------------------------
-            # (A) GitHub에 존재하는 실제 경로/sha 찾기 (NFC/NFD 대응 포함)
-            # ----------------------------------------------------------
-            target_path_on_git = str(file_path)
-            search_name = _nfc(str(file_path))
-
-            def _try_resolve_path_via_listing():
-                """404가 났을 때, 동일 디렉토리 내에서 NFC로 경로를 찾아본다."""
-                # file_path가 "dir/file.json" 형태면 dir만 리스트
-                dir_path = os.path.dirname(target_path_on_git).replace("\\", "/")
-                if dir_path == ".":
-                    dir_path = ""
-                try:
-                    items = repo.get_contents(dir_path, ref=gh_branch)
-                except GithubException:
-                    return None, None
-
-                # get_contents는 단일 파일이면 객체, 폴더면 list
-                if not isinstance(items, list):
-                    items = [items]
-
-                for c in items:
-                    if _nfc(c.path) == search_name:
-                        return c.path, c.sha
-                return None, None
-
-            # 1) 우선: "내가 가진 경로"로 직접 조회 (가장 정확/빠름)
-            target_sha = None
-            try:
-                cur = repo.get_contents(target_path_on_git, ref=gh_branch)
-                target_path_on_git = cur.path
-                target_sha = cur.sha
-            except GithubException as e:
-                if e.status != 404:
-                    raise
-                # 2) 404면: NFC 정규화 비교로 동일 경로 탐색(한글 자모 분리 대응)
-                found_path, found_sha = _try_resolve_path_via_listing()
-                if found_path:
-                    target_path_on_git = found_path
-                    target_sha = found_sha
-                else:
-                    target_sha = None
-
-            # ----------------------------------------------------------
-            # (B) Create/Update (409/422 포함) 다회 재시도 + 백오프
-            # ----------------------------------------------------------
-            MAX_RETRY = 5
-            for attempt in range(1, MAX_RETRY + 1):
-                try:
-                    if target_sha:
-                        # ✅ Update: 매 시도마다 최신 sha 재확인(409 대비)
-                        cur = repo.get_contents(target_path_on_git, ref=gh_branch)
-                        repo.update_file(cur.path, commit_message, json_content, cur.sha, branch=gh_branch)
-                        return True, f"Updated (attempt {attempt})"
-
-                    # ✅ Create
-                    repo.create_file(target_path_on_git, commit_message, json_content, branch=gh_branch)
-                    return True, f"Created (attempt {attempt})"
-
-                except GithubException as e:
-                    # 409: SHA mismatch (동시 업데이트/경합) → 백오프 후 재시도
-                    if e.status == 409:
-                        sleep_s = min(2.0, 0.2 * (2 ** (attempt - 1))) + random.random() * 0.12
-                        time.sleep(sleep_s)
-                        # 다음 루프에서 최신 sha를 다시 읽어 update 시도
-                        target_sha = True  # 플래그 역할(실제 sha는 다음 get_contents에서)
-                        continue
-
-                    # 422: create 경합(이미 누가 생성) 혹은 유효성 에러
-                    # - 이미 생성된 케이스는 update로 전환해 흡수
-                    if e.status == 422:
-                        sleep_s = 0.15 + random.random() * 0.12
-                        time.sleep(sleep_s)
-                        try:
-                            cur = repo.get_contents(target_path_on_git, ref=gh_branch)
-                            target_path_on_git = cur.path
-                            target_sha = cur.sha
-                        except GithubException:
-                            # 여전히 못 찾으면 다음 루프로
-                            pass
-                        continue
-
-                    # 404: 중간에 파일이 사라진 케이스 → create로 전환
-                    if e.status == 404:
-                        target_sha = None
-                        continue
-
-                    return False, f"{e.status} {getattr(e, 'data', '')}"
-
-                except Exception as e:
-                    return False, str(e)
-
-            return False, f"409/422 경합으로 {MAX_RETRY}회 재시도 후 실패"
-
-        except Exception as e:
-            return False, str(e)
+    except Exception as e:
+        print(f"Load Error: {e}")
+        return []
 # endregion
 
 
@@ -1098,13 +1069,14 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             with open(cache_file, 'w', encoding='utf-8') as f: 
                 json.dump(final_list, f, ensure_ascii=False, indent=2)
             
-            # [수정] 업로드 결과를 받아서 실패 시 화면에 띄우기!
-            is_ok, error_msg = upload_to_github(cache_file, final_list)
+            # [변경] 파이어베이스 저장 (청크 분할 방식 적용)
+            # 캐시 파일명(cache_token_xxx.json)을 문서 ID로 사용
+            is_ok, msg = save_to_firebase(os.path.basename(cache_file), final_list)
             
             if is_ok:
-                status_box.success(f"✅ **[{ch_name}]** 깃허브 저장 완료 (+{len(new_videos)})")
+                status_box.success(f"🔥 **[{ch_name}]** 파베 저장 완료 (+{len(new_videos)})")
             else:
-                status_box.error(f"⚠️ **[{ch_name}]** 로컬만 저장됨 / 깃허브 실패:\n{error_msg}")
+                status_box.error(f"⚠️ **[{ch_name}]** 로컬 저장됨 / 파베 실패:\n{msg}")
         else: 
             status_box.success(f"✅ **[{ch_name}]** 최신")
         
@@ -1293,6 +1265,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         'over_1m_count': over_1m_count 
     }
 # endregion
+
 
 # region [5. 메인 UI 및 실행 로직 (Main UI & Execution)]
 # ==========================================
