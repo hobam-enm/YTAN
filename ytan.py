@@ -257,59 +257,30 @@ def normalize_text(text):
 PROMPT_FILE_1ST = "1차 질문 프롬프트.md"
 
 def extract_report_html(text: str) -> str | None:
-    """
-    모델 응답에서 ~ 구간만 뽑아서
-    '진짜 HTML'로 정리해 반환. 없으면 None.
-    - 중간에 ```html / ``` 코드펜스가 섞여도 제거
-    - 들여쓰기(마크다운 코드블록 유발) 제거
-    - 혹시 &lt;div&gt; 형태로 이스케이프된 HTML이면 unescape
-    """
     raw = (text or "")
-
     start = ""
     end = ""
     if start not in raw or end not in raw:
         return None
-
     body = raw.split(start, 1)[1].split(end, 1)[0]
-
-    # (1) 코드펜스 제거 (중간에 섞여도 제거)
     body = re.sub(r"```html\s*", "", body, flags=re.IGNORECASE)
     body = re.sub(r"```", "", body)
-
-    # (2) 혹시 전체가 escape돼 있으면 복구
-    # (예: &lt;div&gt; ... )
     if "&lt;" in body and "&gt;" in body:
         body = _html.unescape(body)
-
-    # (3) 줄 단위로 앞 공백 제거(마크다운 코드블록 방지)
     lines = [ln.lstrip() for ln in body.splitlines()]
     body = "\n".join(lines).strip()
-
     return body if body else None
 
 def render_assistant_content(content: str, css: str = "", height: int = 900):
-    """
-    - REPORT 마커가 있으면: components.html로 렌더
-    - 마커가 없더라도 'HTML로 보이는' 응답이면: components.html로 렌더(들여쓰기/코드펜스 정리 후)
-    - 그 외: 안전 마크다운(escape + <br> 허용)
-    """
     raw = (content or "").strip()
-
-    # 1) 정상 케이스: REPORT 마커 기반 추출
     report_html = extract_report_html(raw)
     if report_html is not None:
         st_html(css + report_html, height=height, scrolling=True)
         return
-
-    # 2) 마커가 빠졌는데 HTML 덩어리만 온 케이스(가끔 Gemini가 이럼)
     raw2 = re.sub(r"^\s*```html\s*", "", raw, flags=re.IGNORECASE)
     raw2 = re.sub(r"^\s*```[a-zA-Z]*\s*", "", raw2)
     raw2 = re.sub(r"\s*```\s*$", "", raw2).strip()
-
-    # 들여쓰기 제거(코드블록 방지)
     raw2 = "\n".join([ln.lstrip() for ln in raw2.splitlines()]).strip()
-
     looks_like_html = (
         "<div" in raw2[:500].lower()
         or "<table" in raw2[:500].lower()
@@ -319,43 +290,25 @@ def render_assistant_content(content: str, css: str = "", height: int = 900):
     if looks_like_html:
         st_html(css + raw2, height=height, scrolling=True)
         return
-
-    # 3) 일반 텍스트/마크다운 fallback (안전)
     st.markdown(render_md_allow_br(raw), unsafe_allow_html=True)
 
-
 def load_text_file(filename: str) -> str:
-    base_dir = Path(__file__).resolve().parent  # ytan.py가 있는 폴더
+    base_dir = Path(__file__).resolve().parent 
     path = base_dir / filename
     return path.read_text(encoding="utf-8")
 
 def load_prompt_file(filename: str) -> str:
-    """Prompt 파일을 읽어온 뒤, 관리 편의상 생길 수 있는 포맷까지 자동 정리합니다.
-
-    - 권장: md 파일에 '그대로' 프롬프트를 붙여넣기 (실제 개행 포함)
-    - 호환: 기존처럼 파이썬 문자열 조각(예: "....\n")을 그대로 붙여넣은 경우에도
-            따옴표 안 텍스트를 합치고 \n을 실제 개행으로 복원합니다.
-    """
     raw = load_text_file(filename)
-    if not raw:
-        return ""
-
+    if not raw: return ""
     raw_stripped = raw.strip()
-
-    # 1) 파이썬 문자열 조각 형태("...\n")가 반복되는 케이스 자동 복원
-    #    - 따옴표 안 내용만 모두 추출해 이어붙임
-    #    - \n -> 실제 개행
-    #    - \" -> "
     if raw_stripped.count('"') >= 10 and "\\n" in raw_stripped:
         parts = re.findall(r'"([^"]*)"', raw_stripped)
         if parts:
             merged = "".join(parts)
-            merged = merged.replace("\\n", "\n").replace("\\t", "\t")  # 줄/탭 복원
+            merged = merged.replace("\\n", "\n").replace("\\t", "\t")
             merged = merged.replace('\\"', '"')
             return merged.strip()
-
     return raw_stripped
-
 
 def format_korean_number(num):
     if num == 0: return "0회"
@@ -401,10 +354,9 @@ def parse_duration_to_minutes(duration_str):
     return round(total_sec / 60, 1)
 
 # ==========================================
-# [변경] Firebase 연동 및 데이터 청크(Chunk) 처리 로직
+# [수정] Firebase 저장 (에러 해결 버전)
 # ==========================================
 def init_firebase():
-    """파이어베이스 앱 초기화 (싱글톤 패턴)"""
     try:
         if not firebase_admin._apps:
             if "firebase" not in st.secrets:
@@ -419,52 +371,48 @@ def init_firebase():
 
 def save_to_firebase(file_name, content_list):
     """
-    1MB 제한을 피하기 위해 리스트를 500개씩 쪼개서 서브컬렉션에 저장합니다.
-    구조: yt_cache (컬렉션) -> 파일명 (문서) -> chunks (서브컬렉션) -> 0, 1, 2... (문서)
+    10MB Payload 제한을 피하기 위해 청크 사이즈를 50개로 줄이고
+    배치 처리를 더 자주 수행합니다.
     """
     try:
         db = init_firebase()
         if not db: return False, "Secrets 설정 오류 또는 DB 연결 실패"
 
-        # 1. 메인 문서 레퍼런스
         doc_ref = db.collection('yt_cache').document(file_name)
         
-        # 2. 기존 청크 데이터 정리 (덮어쓰기 위해)
-        # (주의: 청크 양이 매우 많으면 배치 삭제 로직이 필요하나, 보통 10~20개 내외라 stream 삭제 사용)
+        # 기존 청크 삭제
         old_chunks = doc_ref.collection('chunks').stream()
         for doc in old_chunks:
             doc.reference.delete()
 
-        # 3. 데이터 쪼개기 (Chunking) - 안전하게 500개 단위
-        CHUNK_SIZE = 500
+        # [변경점] 500개 -> 50개로 축소 (안전빵)
+        CHUNK_SIZE = 50 
         total_videos = len(content_list)
         
-        # 메인 문서에는 요약 정보만 기록 (가벼움)
         doc_ref.set({
             'total_count': total_videos,
             'updated_at': firestore.SERVER_TIMESTAMP
         })
 
-        # 4. 조각내서 저장 (Batch Write로 속도 향상)
         batch = db.batch()
         batch_count = 0
         
         for i in range(0, total_videos, CHUNK_SIZE):
             chunk = content_list[i : i + CHUNK_SIZE]
-            chunk_index = str(i // CHUNK_SIZE) # 문서 ID: 0, 1, 2...
+            chunk_index = str(i // CHUNK_SIZE)
             
-            # 서브컬렉션 'chunks'에 저장
             chunk_ref = doc_ref.collection('chunks').document(chunk_index)
             batch.set(chunk_ref, {'data': chunk})
             
             batch_count += 1
-            # Firestore 배치는 최대 500개 작업까지만 가능하므로 400개마다 커밋
-            if batch_count >= 400:
+            
+            # [변경점] 배치가 너무 커지기 전에(20개 묶음마다) 즉시 전송
+            # 50개 비디오 * 20번 = 1000개 비디오마다 커밋 (이 정도면 10MB 안 넘음)
+            if batch_count >= 20:
                 batch.commit()
-                batch = db.batch() # 배치 초기화
+                batch = db.batch()
                 batch_count = 0
         
-        # 남은 작업 커밋
         if batch_count > 0:
             batch.commit()
             
@@ -474,28 +422,21 @@ def save_to_firebase(file_name, content_list):
         return False, str(e)
 
 def load_from_firebase(file_name):
-    """
-    조각난(Chunked) 데이터를 모두 가져와서 하나의 리스트로 합칩니다.
-    """
     try:
         db = init_firebase()
         if not db: return []
 
         doc_ref = db.collection('yt_cache').document(file_name)
-        
-        # 메인 문서 존재 확인
         main_doc = doc_ref.get()
         if not main_doc.exists:
             return []
 
-        # 서브컬렉션 'chunks'에서 모든 조각 가져오기
         chunks_stream = doc_ref.collection('chunks').stream()
         
-        all_videos = []
-        # 문서 ID(0, 1, 2...) 순서대로 정렬 (문자열 정렬 주의: 10이 2보다 앞에 오지 않게 int 변환)
-        # 문서 ID가 숫자형 문자열이라고 가정
+        # ID가 0, 1, 2... 숫자 순서대로 정렬
         sorted_chunks = sorted(chunks_stream, key=lambda x: int(x.id) if x.id.isdigit() else x.id)
         
+        all_videos = []
         for chunk_doc in sorted_chunks:
             chunk_data = chunk_doc.to_dict().get('data', [])
             all_videos.extend(chunk_data)
