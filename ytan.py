@@ -1528,7 +1528,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
             fig_trend = get_daily_trend_chart(final_daily, recent_gap)
             if fig_trend:
-                st.markdown("##### 📈 일별 조회수 추이 (Analytics + Realtime Gap)")
+                st.markdown("##### 📈 일별 조회수 추이 )")
                 with st.container(border=True):
                     st.plotly_chart(fig_trend, use_container_width=True)
                 st.write("")
@@ -1601,9 +1601,16 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
 
             fig_map = get_country_map(final_country)
             if fig_map:
-                st.markdown("##### 🌍 글로벌 조회수 분포")
-                with st.container(border=True):
-                    st.plotly_chart(fig_map, use_container_width=True)
+                # [수정] 화면을 반으로 나누기 (1:1 비율)
+                c_map1, c_map2 = st.columns(2)
+
+                # 왼쪽 컬럼에만 지도 배치
+                with c_map1:
+                    st.markdown("##### 🌍 글로벌 조회수 분포")
+                    with st.container(border=True):
+                        st.plotly_chart(fig_map, use_container_width=True)
+                
+                # 오른쪽(c_map2)은 비워둠 -> 결과적으로 지도가 화면 절반 크기가 됨
                 st.write("")
 
 
