@@ -354,7 +354,7 @@ def parse_duration_to_minutes(duration_str):
     return round(total_sec / 60, 1)
 
 # ==========================================
-# [수정] Firebase 저장 (에러 해결 버전)
+# [수정] Firebase 저장 (이중 제한 해결 버전)
 # ==========================================
 def init_firebase():
     try:
@@ -371,8 +371,8 @@ def init_firebase():
 
 def save_to_firebase(file_name, content_list):
     """
-    10MB Payload 제한을 피하기 위해 청크 사이즈를 50개로 줄이고
-    배치 처리를 더 자주 수행합니다.
+    1. 문서 1개당 1MB 제한 -> 40개씩 쪼개기 (약 0.9MB)
+    2. 전송 1번당 10MB 제한 -> 10묶음씩만 모아서 전송 (약 9MB)
     """
     try:
         db = init_firebase()
@@ -385,8 +385,8 @@ def save_to_firebase(file_name, content_list):
         for doc in old_chunks:
             doc.reference.delete()
 
-        # [변경점] 500개 -> 50개로 축소 (안전빵)
-        CHUNK_SIZE = 50 
+        # [튜닝] 40개: 문서당 1MB 안 넘기는 안전한 숫자
+        CHUNK_SIZE = 40 
         total_videos = len(content_list)
         
         doc_ref.set({
@@ -406,9 +406,9 @@ def save_to_firebase(file_name, content_list):
             
             batch_count += 1
             
-            # [변경점] 배치가 너무 커지기 전에(20개 묶음마다) 즉시 전송
-            # 50개 비디오 * 20번 = 1000개 비디오마다 커밋 (이 정도면 10MB 안 넘음)
-            if batch_count >= 20:
+            # [튜닝] 10개 묶음마다 전송 (40개 * 10 = 400개 데이터)
+            # 총 용량 약 9MB로 맞춰서 10MB 제한 회피
+            if batch_count >= 10:
                 batch.commit()
                 batch = db.batch()
                 batch_count = 0
@@ -433,7 +433,7 @@ def load_from_firebase(file_name):
 
         chunks_stream = doc_ref.collection('chunks').stream()
         
-        # ID가 0, 1, 2... 숫자 순서대로 정렬
+        # ID 정렬
         sorted_chunks = sorted(chunks_stream, key=lambda x: int(x.id) if x.id.isdigit() else x.id)
         
         all_videos = []
@@ -446,145 +446,6 @@ def load_from_firebase(file_name):
     except Exception as e:
         print(f"Load Error: {e}")
         return []
-# endregion
-
-
-# region [2-X. 대화 저장(Export) 유틸 (Chat Export Utilities)]
-# ==========================================
-def _strip_html_tags(raw_html: str) -> str:
-    """HTML을 대략 텍스트로 변환 (TXT 저장용)."""
-    if not raw_html:
-        return ""
-    # 줄바꿈 태그 먼저 처리
-    s = re.sub(r"(?i)<br\s*/?>", "\n", raw_html)
-    s = re.sub(r"</p\s*>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"</div\s*>", "\n", s, flags=re.IGNORECASE)
-    # 나머지 태그 제거
-    s = re.sub(r"<[^>]+>", "", s)
-    # 엔티티 복원
-    s = _html.unescape(s)
-    # 과한 공백 정리
-    s = re.sub(r"\n{3,}", "\n\n", s).strip()
-    return s
-
-
-def _msg_to_export_html(msg: dict) -> str:
-    """
-    chat_history의 단일 메시지를 HTML로 변환.
-    - assistant: REPORT 마커가 있으면 리포트 HTML 그대로 사용
-               없으면 render_md_allow_br로 안전 변환
-    - user: escape 후 <br>만
-    """
-    role = msg.get("role", "")
-    content = (msg.get("content") or "").strip()
-
-    if role == "assistant":
-        report_html = extract_report_html(content)
-        if report_html is not None:
-            body = report_html  # ✅ 이미 예쁘게 렌더되는 리포트 HTML
-        else:
-            # 일반 텍스트/마크다운 → 안전 escape + <br>만 허용
-            body = render_md_allow_br(content).replace("\n", "<br>")
-        who = "AI"
-        cls = "assistant"
-    else:
-        body = html.escape(content).replace("\n", "<br>")
-        who = "사용자"
-        cls = "user"
-
-    return f"""
-    <div class="chat-msg {cls}">
-      <div class="chat-meta">{who}</div>
-      <div class="chat-body">{body}</div>
-    </div>
-    """
-
-
-def build_chat_export_html(chat_history: list, title: str, report_css: str = "") -> str:
-    """
-    대화 전체를 '스크롤 없이 한 페이지'로 저장 가능한 HTML 문서로 생성.
-    - report_css(REPORT_CSS)를 head에 포함해 리포트 테이블/카드 스타일 유지
-    """
-    safe_title = html.escape(title or "대화 기록")
-
-    # report_css는 이미 <style>...</style> 포함 문자열이라 그대로 head에 넣어도 됨
-    extra_css = """
-    <style>
-      body { margin:0; background:#f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", "Apple SD Gothic Neo", sans-serif; }
-      .wrap { max-width: 980px; margin: 24px auto; padding: 0 16px 48px; }
-      .header { background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:16px 18px; box-shadow: 0 6px 18px rgba(0,0,0,0.04); margin-bottom: 14px; }
-      .title { font-size: 18px; font-weight: 800; margin:0; }
-      .sub { margin-top:6px; color:#64748b; font-size:12px; }
-      .chat-msg { background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:14px 16px; box-shadow: 0 6px 18px rgba(0,0,0,0.04); margin: 10px 0; }
-      .chat-msg.user { border-left: 6px solid #94a3b8; }
-      .chat-msg.assistant { border-left: 6px solid #60a5fa; }
-      .chat-meta { font-size: 12px; color:#64748b; margin-bottom: 8px; font-weight:700; }
-      .chat-body { font-size: 14px; color:#0f172a; line-height: 1.55; }
-      /* 리포트 HTML 내부가 .yt-report 기준으로 스타일링 되도록 여백만 약간 보정 */
-      .chat-body .yt-report { margin-top: 6px; }
-      /* 긴 단어/URL 줄바꿈 */
-      .chat-body { word-break: break-word; overflow-wrap: anywhere; }
-    </style>
-    """
-
-    parts = []
-    parts.append(f"<!doctype html><html><head><meta charset='utf-8'><title>{safe_title}</title>")
-    parts.append(report_css or "")
-    parts.append(extra_css)
-    parts.append("</head><body><div class='wrap'>")
-    parts.append(f"""
-      <div class="header">
-        <h1 class="title">{safe_title}</h1>
-        <div class="sub">Exported at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div>
-      </div>
-    """)
-
-    for msg in (chat_history or []):
-        parts.append(_msg_to_export_html(msg))
-
-    parts.append("</div></body></html>")
-    return "\n".join(parts)
-
-
-def build_chat_export_markdown(chat_history: list, title: str) -> str:
-    """대화 전체를 MD로 저장 (보조용)."""
-    lines = [f"# {title}", ""]
-    for msg in (chat_history or []):
-        role = msg.get("role", "")
-        content = (msg.get("content") or "").strip()
-        if role == "assistant":
-            lines.append("## AI")
-            # 리포트 HTML이면 텍스트로 대략 변환해서 넣기
-            rep = extract_report_html(content)
-            if rep is not None:
-                lines.append(_strip_html_tags(rep))
-            else:
-                lines.append(content)
-        else:
-            lines.append("## 사용자")
-            lines.append(content)
-        lines.append("")
-    return "\n".join(lines).strip() + "\n"
-
-
-def build_chat_export_text(chat_history: list, title: str) -> str:
-    """대화 전체를 TXT로 저장 (가장 범용)."""
-    lines = [title, "=" * len(title), ""]
-    for msg in (chat_history or []):
-        role = msg.get("role", "")
-        content = (msg.get("content") or "").strip()
-        if role == "assistant":
-            lines.append("[AI]")
-            rep = extract_report_html(content)
-            if rep is not None:
-                lines.append(_strip_html_tags(rep))
-            else:
-                lines.append(content)
-        else:
-            lines.append("[사용자]")
-            lines.append(content)
-        lines.append("")
-    return "\n".join(lines).strip() + "\n"
 # endregion
 
 
