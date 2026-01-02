@@ -8,43 +8,54 @@ on:
       - "pgc_cache/cache_token_*.json"
   workflow_dispatch: {}
 
+# ===== 동시성 제어 (핵심 수정 사항) =====
+# 동일한 그룹의 작업이 이미 실행 중이면 대기시킵니다.
+# 이를 통해 앞선 작업이 git push를 완료한 뒤에 다음 작업이 실행되므로 충돌이 방지됩니다.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) YTAN 체크아웃
+      # ===== 1. YTAN 체크아웃 =====
       - name: Checkout YTAN
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # 2) YTAN에서 캐시 파일 목록 수집 (루트/pgc_cache 둘 다 지원)
+      # ===== 2. YTAN에서 캐시 파일 수집 =====
+      # 루트 및 pgc_cache 폴더 내의 토큰 파일을 임시 폴더(_cache_src)로 통합
       - name: Collect cache files from YTAN
         id: collect
         shell: bash
         run: |
           set -euo pipefail
 
+          # 임시 소스 폴더 초기화
           rm -rf _cache_src
           mkdir -p _cache_src
           shopt -s nullglob
 
-          # 루트
+          # 1) 루트 경로 파일 수집
           for f in cache_token_*.json; do
             cp -f "$f" "_cache_src/"
           done
 
-          # pgc_cache 폴더
+          # 2) pgc_cache 폴더 파일 수집 (폴더 존재 시)
           if [ -d "pgc_cache" ]; then
             for f in pgc_cache/cache_token_*.json; do
               cp -f "$f" "_cache_src/"
             done
           fi
 
+          # 수집된 파일 개수 확인
           COUNT=$(ls -1 _cache_src 2>/dev/null | wc -l | tr -d ' ')
           echo "count=$COUNT" >> $GITHUB_OUTPUT
 
+          # 파일이 없으면 에러 처리하여 중단
           if [ "$COUNT" -eq 0 ]; then
             echo "❌ No cache_token_*.json found in YTAN (root or pgc_cache/)."
             exit 1
@@ -52,7 +63,8 @@ jobs:
 
           echo "✅ Found $COUNT cache file(s)."
 
-      # 3) 타겟 레포 리스트(2개)에 대해 순차 미러링
+      # ===== 3. 타겟 레포 순차 미러링 =====
+      # 정의된 타겟 리포지토리 목록에 대해 Clone -> Update -> Push 수행
       - name: Mirror to target repos
         shell: bash
         env:
@@ -60,6 +72,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 동기화할 타겟 리포지토리 목록
           TARGET_REPOS=(
             "hobam-enm/-TEST-YTCC-chatbot"
             "hobam-enm/YTCC-chatbot"
@@ -71,25 +84,35 @@ jobs:
             echo "🔁 Syncing to: $REPO"
             echo "=============================="
 
+            # 타겟 리포지토리 클론 (임시 폴더 사용)
             rm -rf _target_repo
             git clone --depth 1 --branch main "https://x-access-token:${YTCC_PAT}@github.com/${REPO}.git" _target_repo
 
+            # 타겟 폴더 준비 및 기존 토큰 삭제 (갱신을 위해)
             mkdir -p _target_repo/pgc_cache
             rm -f _target_repo/pgc_cache/cache_token_*.json
+            
+            # 최신 토큰 파일 복사
             cp -f _cache_src/cache_token_*.json _target_repo/pgc_cache/
 
+            # 변경 사항 확인 및 커밋/푸시
             cd _target_repo
+            
             if [ -z "$(git status --porcelain)" ]; then
               echo "✅ No changes for $REPO"
               cd ..
               continue
             fi
 
+            # 봇 계정 설정
             git config user.name  "ytan-cache-sync-bot"
             git config user.email "actions@users.noreply.github.com"
 
+            # 커밋 및 푸시
             git add pgc_cache/cache_token_*.json
             git commit -m "Sync PGC cache from YTAN @ ${GITHUB_SHA}"
+            
+            # concurrency 설정 덕분에 여기서 충돌 날 확률이 거의 없음
             git push origin main
 
             cd ..
