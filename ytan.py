@@ -68,7 +68,7 @@ import pytz
 
 # [변경] 사이드바 기본 상태: 'collapsed' (접힘)
 st.set_page_config(
-    page_title="Drama YouTube Insight", 
+    page_title="YT(PGC) Data Tracker", 
     page_icon="📊",
     layout="wide", 
     initial_sidebar_state="collapsed" 
