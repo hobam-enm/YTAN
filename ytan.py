@@ -826,36 +826,66 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
         m1,m2,m3,m4,m5,m6 = st.columns(6)
         m1.metric("조회수", f"{int(fin_v):,}"); m2.metric("영상수", f"{fin_cnt:,}"); m3.metric("100만+", f"{fin_1m:,}")
         m4.metric("지속률", f"{avg_p:.1f}%"); m5.metric("좋아요", f"{int(fin_l):,}"); m6.metric("공유", f"{int(fin_s):,}")
+        st.write("")
         
+        # [박스 복구] 성별/연령
         f_d, df_d, _ = get_pyramid_chart_and_df(stt, fin_v)
         if f_d:
             c1,c2=st.columns([1.6,1])
-            with c1: st.plotly_chart(f_d, use_container_width=True)
-            with c2: st.dataframe(df_d, use_container_width=True, hide_index=True, height=300)
+            with c1: 
+                with st.container(border=True):
+                    st.markdown("##### 👥 성별/연령 분포")
+                    st.plotly_chart(f_d, use_container_width=True)
+            with c2: 
+                with st.container(border=True):
+                    st.markdown("##### 📋 상세 데이터")
+                    st.dataframe(df_d, use_container_width=True, hide_index=True, height=300)
+        st.write("")
             
+        # [박스 복구] 일별 추이
         f_t = get_daily_trend_chart(day, gap)
-        if f_t: st.plotly_chart(f_t, use_container_width=True)
+        if f_t: 
+            with st.container(border=True):
+                st.markdown("##### 📈 일별 조회수 추이")
+                st.plotly_chart(f_t, use_container_width=True)
+        st.write("")
         
+        # [박스 복구] Top 100 리스트
         st.markdown("##### 🥇 인기 영상 Top 100")
-        if top_v:
-            dedup = {v['id']:v for v in top_v}.values()
-            top100 = sorted(dedup, key=lambda x:x['period_views'], reverse=True)[:100]
-            df = pd.DataFrame(top100)
-            
-            # https://futureterior.com/page/magazine_modify.html?board_act=edit&no=14017&board_no=2&page=5
-            df['link'] = df['id'].apply(lambda x: f"https://youtu.be/{x}")
-            
-            df_s = df[['title','period_views','avg_pct','period_likes','link']].copy()
-            df_s.columns=['제목','조회수','지속률','좋아요','바로가기']
-            st.data_editor(df_s, column_config={"바로가기":st.column_config.LinkColumn(display_text="Watch 🎬"), "지속률":st.column_config.NumberColumn(format="%.1f%%")}, hide_index=True, use_container_width=True)
+        with st.container(border=True):
+            if top_v:
+                dedup = {v['id']:v for v in top_v}.values()
+                top100 = sorted(dedup, key=lambda x:x['period_views'], reverse=True)[:100]
+                df = pd.DataFrame(top100)
+                
+                # https://futureterior.com/page/magazine_modify.html?board_act=edit&no=14017&board_no=2&page=5
+                df['link'] = df['id'].apply(lambda x: f"https://youtu.be/{x}")
+                
+                df_s = df[['title','period_views','avg_pct','period_likes','link']].copy()
+                df_s.columns=['제목','조회수','지속률','좋아요','바로가기']
+                st.data_editor(df_s, column_config={"바로가기":st.column_config.LinkColumn(display_text="Watch 🎬"), "지속률":st.column_config.NumberColumn(format="%.1f%%")}, hide_index=True, use_container_width=True)
+            else: st.caption("데이터가 없습니다.")
+        st.write("")
         
+        # [박스 복구] 유입경로 & 검색어
         r2_1, r2_2 = st.columns(2)
         f_tr = get_traffic_chart(trf); f_kw = get_keyword_bar_chart(kws)
         with r2_1: 
-            if f_tr: st.plotly_chart(f_tr, use_container_width=True)
+            if f_tr: 
+                with st.container(border=True):
+                    st.markdown("##### 🚦 유입 경로 Top 5")
+                    st.plotly_chart(f_tr, use_container_width=True)
         with r2_2: 
-            if f_kw: st.plotly_chart(f_kw, use_container_width=True)
+            if f_kw: 
+                with st.container(border=True):
+                    st.markdown("##### 🔍 Top 10 검색어 (SEO)")
+                    st.plotly_chart(f_kw, use_container_width=True)
+        st.write("")
             
+        # [박스 복구] 국가별 지도
         f_map = get_country_map(ctr)
-        if f_map: st.plotly_chart(f_map, use_container_width=True)
+        if f_map: 
+            with st.container(border=True):
+                st.markdown("##### 🌍 글로벌 조회수 분포")
+                st.plotly_chart(f_map, use_container_width=True)
 # endregion
