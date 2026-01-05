@@ -861,7 +861,21 @@ def get_creds_from_file(token_filename):
     return creds
 
 def process_sync_channel(token_file, limit_date, status_box, force_rescan):
-    # [추가] DummyBox: 자동 실행 시 UI 에러 방지
+    # [내부함수] DB 로깅용
+    def log_to_db(level, msg, detail=None):
+        try:
+            db = init_firebase()
+            if db:
+                db.collection('system_logs').add({
+                    'level': level,
+                    'msg': msg,
+                    'detail': str(detail),
+                    'source': 'process_sync_channel',
+                    'timestamp': firestore.SERVER_TIMESTAMP
+                })
+        except: pass
+
+    # [UI] DummyBox 처리
     if status_box is None:
         class DummyBox:
             def success(self, m): pass
@@ -872,10 +886,15 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         status_box = DummyBox()
 
     file_label = os.path.basename(token_file).replace("token_", "").replace(".json", "")
+    
+    # 1. 인증 및 채널 정보 획득
     creds = get_creds_from_file(token_file)
     if not creds: 
-        status_box.error(f"❌ [{file_label}] 토큰 오류")
+        err_msg = f"❌ [{file_label}] 토큰 오류 (파일 읽기 실패)"
+        status_box.error(err_msg)
+        log_to_db('error', err_msg, token_file)
         return None
+        
     try:
         youtube = googleapiclient.discovery.build('youtube', 'v3', credentials=creds)
         ch_res = youtube.channels().list(part='snippet,contentDetails', mine=True).execute()
@@ -886,65 +905,90 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         uploads_id = ch_info['contentDetails']['relatedPlaylists']['uploads']
         
         cache_file = f"cache_{token_file}"
-        
         cached_videos = []
         cached_ids = set()
         
+        # 2. 로컬 캐시 로드
         if not force_rescan and os.path.exists(cache_file):
             with open(cache_file, 'r', encoding='utf-8') as f: cached_videos = json.load(f)
             cached_ids = {v['id'] for v in cached_videos}
-            status_box.info(f"🔄 [{ch_name}] 확인 중...")
+            status_box.info(f"🔄 [{ch_name}] 로컬 데이터 확인 ({len(cached_videos)}개)...")
         else: 
-            if os.path.exists(cache_file):
-                with open(cache_file, 'r', encoding='utf-8') as f: cached_videos = json.load(f)
             status_box.info(f"⏳ [{ch_name}] 스캔 시작")
         
         new_videos = []; next_page_token = None; stop_scanning = False
         
+        # 3. 유튜브 API 스캔
         while not stop_scanning:
             req = youtube.playlistItems().list(part='snippet', playlistId=uploads_id, maxResults=50, pageToken=next_page_token)
             res = req.execute()
+            
             for item in res['items']:
                 vid = item['snippet']['resourceId']['videoId']
                 title = item['snippet']['title']
                 desc = item['snippet']['description']
                 p_at = item['snippet']['publishedAt']
                 
-                if p_at < limit_date: stop_scanning = True; break
-                
-                if not force_rescan and vid in cached_ids: 
+                if p_at < limit_date: 
                     stop_scanning = True; break
                 
+                # [중요] 로컬에 있으면 스캔은 멈추지만, 나중에 파베 저장은 수행해야 함
+                if not force_rescan and vid in cached_ids: 
+                    stop_scanning = True
+                    # 왜 멈췄는지 로그 (디버깅용)
+                    if not new_videos:
+                        log_to_db('info', f"[{ch_name}] API 스캔 중단 (로컬 데이터와 일치)", f"기준영상: {title}")
+                    break
+                
                 new_videos.append({'id': vid, 'title': title, 'date': p_at, 'description': desc})
+            
             if len(new_videos) > 0 and len(new_videos) % 50 == 0:
                 status_box.markdown(f"🏃 **[{ch_name}]** +{len(new_videos)}")
+            
             if not res.get('nextPageToken'): stop_scanning = True
             next_page_token = res.get('nextPageToken')
             if not next_page_token: stop_scanning = True
         
+        # 4. 데이터 병합
         if force_rescan:
             preserved_videos = [v for v in cached_videos if v['date'] < limit_date]
             final_list = new_videos + preserved_videos
         else:
             final_list = new_videos + cached_videos
         
+        # -----------------------------------------------------------
+        # [수정된 부분] 저장 로직 분리
+        # -----------------------------------------------------------
+        
+        # (A) 로컬 파일 저장은 '변경사항이 있을 때만' (디스크 보호)
         if new_videos or force_rescan:
             with open(cache_file, 'w', encoding='utf-8') as f: 
                 json.dump(final_list, f, ensure_ascii=False, indent=2)
-            
-            # 파이어베이스 저장
-            is_ok, msg = save_to_firebase(os.path.basename(cache_file), final_list)
-            
-            if is_ok:
-                status_box.success(f"🔥 **[{ch_name}]** 파베 저장 완료 (+{len(new_videos)})")
+                
+        # (B) 파이어베이스 저장은 '항상' 수행하여 싱크 맞춤
+        #     (새 영상이 없어도, 파베가 비어있을 수 있으므로 강제 저장)
+        is_ok, msg = save_to_firebase(os.path.basename(cache_file), final_list)
+        
+        log_msg = f"[{ch_name}] 처리 완료 (총 {len(final_list)}개)"
+        
+        if is_ok:
+            if new_videos:
+                status_box.success(f"🔥 **[{ch_name}] 업데이트 완료 (+{len(new_videos)})**")
+                log_to_db('success', f"[{ch_name}] 업데이트 및 DB 저장", f"추가: {len(new_videos)} / 총: {len(final_list)}")
             else:
-                status_box.error(f"⚠️ **[{ch_name}]** 로컬 저장됨 / 파베 실패:\n{msg}")
-        else: 
-            status_box.success(f"✅ **[{ch_name}]** 최신")
+                # 변경사항 없어도 DB 저장은 성공했음을 표시
+                status_box.success(f"✅ **[{ch_name}] 최신 유지 (DB 동기화 완료)**")
+                # 너무 잦은 로그가 싫으면 아래 줄 주석 처리
+                log_to_db('info', f"[{ch_name}] 최신 상태 유지", f"총 {len(final_list)}개 동기화")
+        else:
+            status_box.error(f"⚠️ **[{ch_name}]** 파베 저장 실패:\n{msg}")
+            log_to_db('warning', f"[{ch_name}] 파베 저장 실패", msg)
         
         return {'creds': creds, 'name': ch_name, 'videos': final_list}
+        
     except Exception as e:
         status_box.error(f"❌ 에러: {str(e)}")
+        log_to_db('fatal_error', f"[{file_label}] 로직 에러", str(e))
         return {'error': str(e)}
 
 def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_start, anl_end):
@@ -1132,21 +1176,48 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
 # ==========================================
 def job_auto_update_data():
     print(f"⏰ [Auto-Update] 자동 수집 시작: {datetime.now()}")
+    
+    # DB 연결 (시스템 로그용)
+    db = init_firebase() 
+    
     token_files = glob.glob("token_*.json")
     if not token_files:
-        print("❌ 토큰 파일 없음")
+        msg = "❌ [Auto] 토큰 파일이 하나도 없습니다."
+        print(msg)
+        if db: db.collection('system_logs').add({'level': 'error', 'msg': msg, 'time': firestore.SERVER_TIMESTAMP})
         return
 
     try:
+        success_cnt = 0
         for tf in token_files:
-            process_sync_channel(tf, DEFAULT_LIMIT_DATE, None, False)
-            print(f"✅ [Auto-Update] 완료: {tf}")
+            # 위에서 수정한 함수가 호출되면서 내부적으로 로그를 남깁니다.
+            res = process_sync_channel(tf, DEFAULT_LIMIT_DATE, None, False)
+            if res and 'error' not in res:
+                success_cnt += 1
+            print(f"✅ [Auto-Update] 처리 시도: {tf}")
         
+        # 캐시 초기화
         load_from_firebase.clear()
         get_last_update_time.clear()
         
+        # 최종 완료 로그
+        if db:
+            db.collection('system_logs').add({
+                'level': 'info',
+                'msg': f"⏰ [Auto] 스케줄러 실행 완료",
+                'detail': f"시도: {len(token_files)}개 / 성공반환: {success_cnt}개",
+                'time': firestore.SERVER_TIMESTAMP
+            })
+            
     except Exception as e:
-        print(f"⚠️ [Auto-Update] 에러 발생: {e}")
+        err_msg = f"⚠️ [Auto-Update] 스케줄러 멈춤 (Crash): {e}"
+        print(err_msg)
+        if db:
+            db.collection('system_logs').add({
+                'level': 'fatal_error',
+                'msg': err_msg,
+                'time': firestore.SERVER_TIMESTAMP
+            })
 
 @st.cache_resource
 def init_scheduler():
