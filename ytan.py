@@ -1234,7 +1234,7 @@ init_scheduler()
 
 # region [5. 메인 UI 및 실행 로직 (Main UI & Execution)]
 # ==========================================
-st.title("📊 Youtube(PGC) Data Insight")
+st.title("📊 YT(PGC) Data Scanner")
 
 # --- 사이드바 ---
 with st.sidebar:
