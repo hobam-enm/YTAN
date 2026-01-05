@@ -609,7 +609,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 tot_v += fin_v; tot_l += fin_l
                 if fin_v>0 and a_data['p']>0:
                     w_avg_sum += (fin_v*a_data['p']); v_for_avg += fin_v
-                if rt_v >= 1000000: over_1m += 1
+                if fin_v >= 1000000: over_1m += 1
                 
                 if fin_v > 0:
                     dur = parse_duration_to_minutes(rt_item.get('contentDetails',{}).get('duration'))
@@ -823,12 +823,13 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
         avg_p = (w_avg/v_avg) if v_avg>0 else 0
         gap = fin_v - sum(day.values())
         
+        # [메트릭 포맷팅은 이미 적용됨: :, .1f%]
         m1,m2,m3,m4,m5,m6 = st.columns(6)
         m1.metric("조회수", f"{int(fin_v):,}"); m2.metric("영상수", f"{fin_cnt:,}"); m3.metric("100만+", f"{fin_1m:,}")
         m4.metric("지속률", f"{avg_p:.1f}%"); m5.metric("좋아요", f"{int(fin_l):,}"); m6.metric("공유", f"{int(fin_s):,}")
         st.write("")
         
-        # [박스 복구] 성별/연령
+        # [수정 1] 성별/연령 상세 데이터 포맷팅
         f_d, df_d, _ = get_pyramid_chart_and_df(stt, fin_v)
         if f_d:
             c1,c2=st.columns([1.6,1])
@@ -839,10 +840,14 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
             with c2: 
                 with st.container(border=True):
                     st.markdown("##### 📋 상세 데이터")
-                    st.dataframe(df_d, use_container_width=True, hide_index=True, height=300)
+                    # 보기 좋게 문자열로 포맷팅 변환
+                    df_d_disp = df_d.copy()
+                    df_d_disp['조회수'] = df_d_disp['조회수'].apply(lambda x: f"{x:,}")
+                    df_d_disp['비율'] = df_d_disp['비율'].apply(lambda x: f"{x:.1f}%")
+                    st.dataframe(df_d_disp, use_container_width=True, hide_index=True, height=300)
         st.write("")
             
-        # [박스 복구] 일별 추이
+        # [박스 유지] 일별 추이
         f_t = get_daily_trend_chart(day, gap)
         if f_t: 
             with st.container(border=True):
@@ -850,7 +855,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 st.plotly_chart(f_t, use_container_width=True)
         st.write("")
         
-        # [박스 복구] Top 100 리스트
+        # [수정 2] Top 100 리스트 포맷팅 (#,### 및 NN.N%)
         st.markdown("##### 🥇 인기 영상 Top 100")
         with st.container(border=True):
             if top_v:
@@ -858,16 +863,29 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 top100 = sorted(dedup, key=lambda x:x['period_views'], reverse=True)[:100]
                 df = pd.DataFrame(top100)
                 
-                # https://futureterior.com/page/magazine_modify.html?board_act=edit&no=14017&board_no=2&page=5
                 df['link'] = df['id'].apply(lambda x: f"https://youtu.be/{x}")
                 
                 df_s = df[['title','period_views','avg_pct','period_likes','link']].copy()
                 df_s.columns=['제목','조회수','지속률','좋아요','바로가기']
-                st.data_editor(df_s, column_config={"바로가기":st.column_config.LinkColumn(display_text="Watch 🎬"), "지속률":st.column_config.NumberColumn(format="%.1f%%")}, hide_index=True, use_container_width=True)
+                
+                # 숫자 포맷팅 (콤마) - 문자열로 변환하여 깔끔하게 표시
+                df_s['조회수'] = df_s['조회수'].apply(lambda x: f"{x:,}")
+                df_s['좋아요'] = df_s['좋아요'].apply(lambda x: f"{x:,}")
+                
+                # 지속률은 NumberColumn의 format 기능 사용 (정렬 기능 유지를 위해 숫자로 남김)
+                st.data_editor(
+                    df_s, 
+                    column_config={
+                        "바로가기": st.column_config.LinkColumn(display_text="Watch 🎬"), 
+                        "지속률": st.column_config.NumberColumn(format="%.1f%%")
+                    }, 
+                    hide_index=True, 
+                    use_container_width=True
+                )
             else: st.caption("데이터가 없습니다.")
         st.write("")
         
-        # [박스 복구] 유입경로 & 검색어
+        # [박스 유지] 유입경로 & 검색어
         r2_1, r2_2 = st.columns(2)
         f_tr = get_traffic_chart(trf); f_kw = get_keyword_bar_chart(kws)
         with r2_1: 
@@ -882,7 +900,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                     st.plotly_chart(f_kw, use_container_width=True)
         st.write("")
             
-        # [박스 복구] 국가별 지도
+        # [박스 유지] 국가별 지도
         f_map = get_country_map(ctr)
         if f_map: 
             with st.container(border=True):
