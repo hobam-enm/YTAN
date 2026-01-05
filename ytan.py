@@ -529,7 +529,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             if not next_pg: stop = True
             
             # [핵심 수정] 과속 방지 턱 (API 누락 방지)
-            time.sleep(0.1)
+            time.sleep(0.3)
         
         if force_rescan:
             final_list = new_videos
