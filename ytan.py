@@ -430,7 +430,7 @@ def get_creds_from_file(token_filename):
     return creds
 
 def process_sync_channel(token_file, limit_date, status_box, force_rescan):
-    # [내부함수] MongoDB 로깅
+    # [내부함수] MongoDB 로깅 (독립적으로 작동)
     def log_to_db(level, msg, detail=None):
         try:
             client = init_mongo()
@@ -445,7 +445,6 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
                 })
         except: pass
 
-    # [UI] DummyBox
     if status_box is None:
         class DummyBox:
             def success(self, m): pass
@@ -470,7 +469,6 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         
         cache_name = f"cache_{os.path.basename(token_file)}"
         
-        # [변경] 로컬 파일 체크 대신 MongoDB 로드
         if force_rescan:
             cached_videos = []
             cached_ids = set()
@@ -481,6 +479,8 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             status_box.info(f"🔄 [{ch_name}] DB 확인 ({len(cached_videos)}개)...")
         
         new_videos = []; next_pg = None; stop = False
+        consecutive_cached_count = 0
+        SAFE_BUFFER = 50 
         
         while not stop:
             req = youtube.playlistItems().list(part='snippet', playlistId=uploads_id, maxResults=50, pageToken=next_pg)
@@ -494,14 +494,20 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
                     stop = True; break
                 
                 if not force_rescan and vid in cached_ids:
-                    stop = True; break
-                
-                new_videos.append({
-                    'id': vid, 
-                    'title': item['snippet']['title'], 
-                    'date': p_at, 
-                    'description': item['snippet']['description']
-                })
+                    consecutive_cached_count += 1
+                    if consecutive_cached_count >= SAFE_BUFFER:
+                        status_box.caption(f"✋ 안전지대 도달 (연속 {SAFE_BUFFER}개 중복). 수집 종료.")
+                        stop = True
+                        break
+                    continue 
+                else:
+                    consecutive_cached_count = 0
+                    new_videos.append({
+                        'id': vid, 
+                        'title': item['snippet']['title'], 
+                        'date': p_at, 
+                        'description': item['snippet']['description']
+                    })
             
             if len(new_videos) > 0 and len(new_videos)%50==0:
                 status_box.markdown(f"🏃 **[{ch_name}]** +{len(new_videos)}")
@@ -514,7 +520,6 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         else:
             final_list = new_videos + cached_videos
         
-        # [변경] MongoDB 저장
         is_ok, msg = save_to_mongodb(cache_name, final_list)
         
         if is_ok:
@@ -535,19 +540,21 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         return {'error': str(e)}
 
 def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_start, anl_end):
-    # (기존 분석 로직 유지 - DB 미사용)
     creds = channel_data['creds']; videos = channel_data['videos']
     norm_kw = normalize_text(keyword)
-    target_ids = []; id_map = {}; date_map = {}
+    
+    temp_target_ids = [] 
+    id_map = {}; date_map = {}
     
     for v in videos:
         if norm_kw in normalize_text(v['title']) or norm_kw in normalize_text(v.get('description','')):
             v_dt = parse_utc_to_kst_date(v['date'])
             if v_dt and (vid_start <= v_dt <= vid_end):
-                target_ids.append(v['id'])
+                temp_target_ids.append(v['id'])
                 id_map[v['id']] = v['title']
                 date_map[v['id']] = v['date']
-            
+    
+    target_ids = list(dict.fromkeys(temp_target_ids))
     if not target_ids: return None
     
     yt_anl = googleapiclient.discovery.build('youtubeAnalytics', 'v2', credentials=creds)
@@ -562,41 +569,66 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     anl_end_date = datetime.strptime(str(anl_end), "%Y-%m-%d").date() if isinstance(anl_end, str) else anl_end
     use_hybrid = anl_end_date >= (today - timedelta(days=2))
     
-    for i in range(0, len(target_ids), 50):
-        batch = target_ids[i:i+50]; vid_str = ",".join(batch)
+    def fetch_batch_data(batch_ids):
+        vid_str = ",".join(batch_ids)
+        r_v = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
+        local_anl = {r[0]:{'v':r[1],'l':r[2],'p':r[3]} for r in r_v.get('rows',[])}
+        
+        r_s = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
+        local_s = r_s.get('rows', [])
+        
+        r_d = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='viewerPercentage', dimensions='ageGroup,gender', filters=f'video=={vid_str}').execute()
+        local_demo = r_d.get('rows', [])
+        
+        r_tr = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceType', filters=f'video=={vid_str}').execute()
+        local_tr = r_tr.get('rows', [])
+        
+        local_kws = []
         try:
-            r_v = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
-            anl_map = {r[0]:{'v':r[1],'l':r[2],'p':r[3]} for r in r_v.get('rows',[])}
-            
-            r_s = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
-            if 'rows' in r_s: tot_s += r_s['rows'][0][0]
-            
-            r_d = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='viewerPercentage', dimensions='ageGroup,gender', filters=f'video=={vid_str}').execute()
-            b_v = sum(x['v'] for x in anl_map.values())
-            for r in r_d.get('rows',[]): demo[f"{r[0]}_{r[1]}"] += b_v*(r[2]/100)
-            
-            r_tr = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceType', filters=f'video=={vid_str}').execute()
-            for r in r_tr.get('rows',[]): traffic[r[0]] += r[1]
-            
-            try:
-                r_k = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceDetail', filters=f'video=={vid_str};insightTrafficSourceType==YT_SEARCH', maxResults=15, sort='-views').execute()
-                for r in r_k.get('rows',[]): 
-                    if r[0]!='GOOGLE_SEARCH': kws[r[0]]+=r[1]
-            except: pass
-            
-            r_c = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='country', filters=f'video=={vid_str}', maxResults=50).execute()
-            for r in r_c.get('rows',[]): country[r[0]]+=r[1]
-            
-            r_dy = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
-            for r in r_dy.get('rows',[]): daily[r[0]]+=r[1]
+            r_k = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceDetail', filters=f'video=={vid_str};insightTrafficSourceType==YT_SEARCH', maxResults=15, sort='-views').execute()
+            local_kws = r_k.get('rows', [])
+        except: pass
+        
+        r_c = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='country', filters=f'video=={vid_str}', maxResults=50).execute()
+        local_ctr = r_c.get('rows', [])
+        
+        r_dy = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
+        local_day = r_dy.get('rows', [])
+        
+        rt_res = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
+        local_rt = {item['id']: item for item in rt_res.get('items',[])}
 
-            rt_res = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
-            rt_map = {item['id']: item for item in rt_res.get('items',[])}
+        return local_anl, local_s, local_demo, local_tr, local_kws, local_ctr, local_day, local_rt
+
+    for i in range(0, len(target_ids), 50):
+        batch = target_ids[i:i+50]
+        
+        try:
+            results = fetch_batch_data(batch)
+            process_queue = [(batch, results)]
+        except:
+            process_queue = []
+            for single_id in batch:
+                try:
+                    res_single = fetch_batch_data([single_id])
+                    process_queue.append(([single_id], res_single))
+                except: pass
+
+        for batch_ids, (l_anl, l_s, l_demo, l_tr, l_kws, l_ctr, l_day, l_rt) in process_queue:
+            if l_s: tot_s += l_s[0][0]
             
-            for vid_id in batch:
+            b_v = sum(x['v'] for x in l_anl.values())
+            for r in l_demo: demo[f"{r[0]}_{r[1]}"] += b_v*(r[2]/100)
+            for r in l_tr: traffic[r[0]] += r[1]
+            for r in l_kws: 
+                if r[0]!='GOOGLE_SEARCH': kws[r[0]]+=r[1]
+            for r in l_ctr: country[r[0]]+=r[1]
+            for r in l_day: daily[r[0]]+=r[1]
+            
+            for vid_id in batch_ids:
                 v_up = parse_utc_to_kst_date(date_map[vid_id])
-                a_data = anl_map.get(vid_id, {'v':0,'l':0,'p':0})
-                rt_item = rt_map.get(vid_id, {})
+                a_data = l_anl.get(vid_id, {'v':0,'l':0,'p':0})
+                rt_item = l_rt.get(vid_id, {})
                 rt_stat = rt_item.get('statistics', {})
                 rt_v = int(rt_stat.get('viewCount',0)); rt_l = int(rt_stat.get('likeCount',0))
                 
@@ -609,6 +641,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 tot_v += fin_v; tot_l += fin_l
                 if fin_v>0 and a_data['p']>0:
                     w_avg_sum += (fin_v*a_data['p']); v_for_avg += fin_v
+                
                 if fin_v >= 1000000: over_1m += 1
                 
                 if fin_v > 0:
@@ -618,8 +651,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                         'views': rt_v, 'period_views': fin_v, 'period_likes': fin_l,
                         'avg_pct': a_data['p'], 'duration_min': dur
                     })
-        except: pass
-        
+
     if not top_vids and tot_v==0: return None
     top_vids.sort(key=lambda x: x['period_views'], reverse=True)
     
@@ -632,9 +664,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         'over_1m_count': over_1m
     }
 
-# ==========================================
-# [추가] 자동 스케줄러 (매일 아침 9시)
-# ==========================================
+# [스케줄러] - log_to_mongo 의존성 제거
 def job_auto_update_data():
     print(f"⏰ [Auto] 시작: {datetime.now()}")
     token_files = glob.glob("token_*.json")
@@ -646,23 +676,33 @@ def job_auto_update_data():
             res = process_sync_channel(tf, DEFAULT_LIMIT_DATE, None, False)
             if res and 'error' not in res: cnt+=1
         
-        # 캐시 무효화
         load_from_mongodb.clear()
         get_last_update_time.clear()
         
-        # 로그 저장
+        # 로그 저장 (직접 DB 호출)
         try:
             client = init_mongo()
             if client:
                 client.get_database("yt_dashboard").get_collection("system_logs").insert_one({
                     'level': 'info', 'msg': "스케줄러 완료",
                     'detail': f"성공: {cnt}/{len(token_files)}",
+                    'source': 'scheduler',
                     'timestamp': datetime.now()
                 })
         except: pass
         
     except Exception as e:
-        print(f"스케줄러 오류: {e}")
+        # 에러 로그 (직접 DB 호출)
+        try:
+            client = init_mongo()
+            if client:
+                client.get_database("yt_dashboard").get_collection("system_logs").insert_one({
+                    'level': 'fatal', 'msg': "스케줄러 오류",
+                    'detail': str(e),
+                    'source': 'scheduler',
+                    'timestamp': datetime.now()
+                })
+        except: pass
 
 @st.cache_resource
 def init_scheduler():
@@ -751,7 +791,6 @@ if 'channels_data' not in st.session_state or not st.session_state['channels_dat
     temp = []
     for tf in token_files:
         c_name = f"cache_{os.path.basename(tf)}"
-        # [변경] MongoDB 로드
         vids = load_from_mongodb(c_name)
         if vids:
             creds = get_creds_from_file(tf)
@@ -823,13 +862,11 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
         avg_p = (w_avg/v_avg) if v_avg>0 else 0
         gap = fin_v - sum(day.values())
         
-        # [메트릭 포맷팅은 이미 적용됨: :, .1f%]
         m1,m2,m3,m4,m5,m6 = st.columns(6)
         m1.metric("조회수", f"{int(fin_v):,}"); m2.metric("영상수", f"{fin_cnt:,}"); m3.metric("100만+", f"{fin_1m:,}")
         m4.metric("지속률", f"{avg_p:.1f}%"); m5.metric("좋아요", f"{int(fin_l):,}"); m6.metric("공유", f"{int(fin_s):,}")
         st.write("")
         
-        # [수정 1] 성별/연령 상세 데이터 포맷팅
         f_d, df_d, _ = get_pyramid_chart_and_df(stt, fin_v)
         if f_d:
             c1,c2=st.columns([1.6,1])
@@ -840,14 +877,12 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
             with c2: 
                 with st.container(border=True):
                     st.markdown("##### 📋 상세 데이터")
-                    # 보기 좋게 문자열로 포맷팅 변환
                     df_d_disp = df_d.copy()
                     df_d_disp['조회수'] = df_d_disp['조회수'].apply(lambda x: f"{x:,}")
                     df_d_disp['비율'] = df_d_disp['비율'].apply(lambda x: f"{x:.1f}%")
                     st.dataframe(df_d_disp, use_container_width=True, hide_index=True, height=300)
         st.write("")
             
-        # [박스 유지] 일별 추이
         f_t = get_daily_trend_chart(day, gap)
         if f_t: 
             with st.container(border=True):
@@ -855,7 +890,6 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 st.plotly_chart(f_t, use_container_width=True)
         st.write("")
         
-        # [수정 2] Top 100 리스트 포맷팅 (#,### 및 NN.N%)
         st.markdown("##### 🥇 인기 영상 Top 100")
         with st.container(border=True):
             if top_v:
@@ -868,11 +902,9 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 df_s = df[['title','period_views','avg_pct','period_likes','link']].copy()
                 df_s.columns=['제목','조회수','지속률','좋아요','바로가기']
                 
-                # 숫자 포맷팅 (콤마) - 문자열로 변환하여 깔끔하게 표시
                 df_s['조회수'] = df_s['조회수'].apply(lambda x: f"{x:,}")
                 df_s['좋아요'] = df_s['좋아요'].apply(lambda x: f"{x:,}")
                 
-                # 지속률은 NumberColumn의 format 기능 사용 (정렬 기능 유지를 위해 숫자로 남김)
                 st.data_editor(
                     df_s, 
                     column_config={
@@ -885,6 +917,23 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
             else: st.caption("데이터가 없습니다.")
         st.write("")
         
+        # [수정: 시각화 추가] 채널별 점유율 & 글로벌 지도 병렬 배치
+        f_share = get_channel_share_chart(tgt, highlight_channel=(sel if sel!="전체 합산" else None))
+        f_map = get_country_map(ctr)
+        
+        c_share, c_map = st.columns(2)
+        with c_share:
+             if f_share:
+                with st.container(border=True):
+                    st.markdown("##### 🏆 채널별 조회수 점유율")
+                    st.plotly_chart(f_share, use_container_width=True)
+        with c_map:
+            if f_map:
+                with st.container(border=True):
+                    st.markdown("##### 🌍 글로벌 조회수 분포")
+                    st.plotly_chart(f_map, use_container_width=True)
+        st.write("")
+
         # [박스 유지] 유입경로 & 검색어
         r2_1, r2_2 = st.columns(2)
         f_tr = get_traffic_chart(trf); f_kw = get_keyword_bar_chart(kws)
@@ -898,12 +947,4 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                 with st.container(border=True):
                     st.markdown("##### 🔍 Top 10 검색어 (SEO)")
                     st.plotly_chart(f_kw, use_container_width=True)
-        st.write("")
-            
-        # [박스 유지] 국가별 지도
-        f_map = get_country_map(ctr)
-        if f_map: 
-            with st.container(border=True):
-                st.markdown("##### 🌍 글로벌 조회수 분포")
-                st.plotly_chart(f_map, use_container_width=True)
 # endregion
