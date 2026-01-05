@@ -430,7 +430,7 @@ def get_creds_from_file(token_filename):
     return creds
 
 def process_sync_channel(token_file, limit_date, status_box, force_rescan):
-    # [내부함수] MongoDB 로깅 (독립적으로 작동)
+    # [내부함수] MongoDB 로깅
     def log_to_db(level, msg, detail=None):
         try:
             client = init_mongo()
@@ -452,6 +452,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             def warning(self, m): pass
             def info(self, m): pass
             def markdown(self, m): pass
+            def caption(self, m): pass
         status_box = DummyBox()
 
     file_label = os.path.basename(token_file).replace("token_", "").replace(".json", "")
@@ -472,7 +473,8 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         if force_rescan:
             cached_videos = []
             cached_ids = set()
-            status_box.info(f"🔥 [{ch_name}] 전체 재수집 시작")
+            # [디버깅] 실제 적용된 날짜를 눈으로 확인시켜줌 (범인 검거용)
+            status_box.info(f"🔥 [{ch_name}] 전체 재수집 시작 (Limit: {limit_date})")
         else:
             cached_videos = load_from_mongodb(cache_name)
             cached_ids = {v['id'] for v in cached_videos}
@@ -486,10 +488,21 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             req = youtube.playlistItems().list(part='snippet', playlistId=uploads_id, maxResults=50, pageToken=next_pg)
             res = req.execute()
             
-            for item in res['items']:
+            items = res.get('items', [])
+            if not items:
+                # 아이템이 없으면 바로 멈추지 말고 페이지 토큰이라도 있는지 확인 (빈 페이지 방지)
+                if not res.get('nextPageToken'):
+                    stop = True
+                else:
+                    next_pg = res.get('nextPageToken')
+                    time.sleep(0.1) # 과속 방지
+                    continue
+            
+            for item in items:
                 vid = item['snippet']['resourceId']['videoId']
                 p_at = item['snippet']['publishedAt']
                 
+                # 날짜 제한 체크 (String 비교)
                 if p_at < limit_date: 
                     stop = True; break
                 
@@ -514,20 +527,27 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             
             next_pg = res.get('nextPageToken')
             if not next_pg: stop = True
+            
+            # [핵심 수정] 과속 방지 턱 (API 누락 방지)
+            time.sleep(0.1)
         
         if force_rescan:
             final_list = new_videos
         else:
             final_list = new_videos + cached_videos
+            
+        # [핵심 수정] 최종 저장 전 중복 제거 (Clean Data)
+        # ID가 같은 녀석이 있으면 하나만 남김
+        final_list = list({v['id']:v for v in final_list}.values())
         
         is_ok, msg = save_to_mongodb(cache_name, final_list)
         
         if is_ok:
             if new_videos:
-                status_box.success(f"🔥 **[{ch_name}] +{len(new_videos)} 업데이트**")
+                status_box.success(f"🔥 **[{ch_name}] +{len(new_videos)} 업데이트** (총 {len(final_list)}개)")
                 log_to_db('success', f"[{ch_name}] 업데이트 완료", f"추가: {len(new_videos)}")
             else:
-                status_box.success(f"✅ **[{ch_name}] 최신 유지**")
+                status_box.success(f"✅ **[{ch_name}] 최신 유지** (총 {len(final_list)}개)")
         else:
             status_box.error(f"DB 저장 실패: {msg}")
             log_to_db('error', f"[{ch_name}] 저장 실패", msg)
@@ -540,6 +560,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         return {'error': str(e)}
 
 def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_start, anl_end):
+    # (이 부분은 이전과 동일하므로 생략하지 않고 그대로 유지 - Batch Retry 안전장치 포함)
     creds = channel_data['creds']; videos = channel_data['videos']
     norm_kw = normalize_text(keyword)
     
