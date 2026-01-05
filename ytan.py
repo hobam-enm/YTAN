@@ -1541,7 +1541,7 @@ if 'channels_data' in st.session_state and st.session_state['channels_data']:
                     top_vids = sorted(deduped_vids, key=lambda x: x['period_views'], reverse=True)[:100]
                     
                     df_top = pd.DataFrame(top_vids)
-                    df_top['link'] = df_top['id'].apply(lambda x: f"[https://youtu.be/](https://youtu.be/){x}")
+                    df_top['link'] = df_top['id'].apply(lambda x: f"https://youtu.be/{x}")
                     
                     df_show = df_top[['title', 'period_views', 'avg_pct', 'period_likes', 'link']].copy()
                     df_show.columns = ['제목', '조회수', '지속률(%)', '좋아요', '바로가기']
