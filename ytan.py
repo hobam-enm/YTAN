@@ -136,7 +136,7 @@ st.markdown(custom_css, unsafe_allow_html=True)
 
 MAX_WORKERS = 7
 SCOPES = ['https://www.googleapis.com/auth/yt-analytics.readonly', 'https://www.googleapis.com/auth/youtube.readonly']
-DEFAULT_LIMIT_DATE = "2025-01-01"
+DEFAULT_LIMIT_DATE = "2024-01-01"
 
 ISO_MAPPING = {
     'KR': 'KOR', 'US': 'USA', 'JP': 'JPN', 'VN': 'VNM', 'TH': 'THA', 
