@@ -9,3 +9,5 @@ extra-streamlit-components
 google-generativeai
 firebase_admin
 apscheduler
+pymongo
+dnspython
