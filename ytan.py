@@ -560,10 +560,11 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         return {'error': str(e)}
 
 def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_start, anl_end):
-    # (이 부분은 이전과 동일하므로 생략하지 않고 그대로 유지 - Batch Retry 안전장치 포함)
     creds = channel_data['creds']; videos = channel_data['videos']
     norm_kw = normalize_text(keyword)
     
+    # [1] 필터링 (Keyword & Date)
+    # 중복 제거 및 필터링
     temp_target_ids = [] 
     id_map = {}; date_map = {}
     
@@ -578,6 +579,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     target_ids = list(dict.fromkeys(temp_target_ids))
     if not target_ids: return None
     
+    # [2] API 준비
     yt_anl = googleapiclient.discovery.build('youtubeAnalytics', 'v2', credentials=creds)
     youtube = googleapiclient.discovery.build('youtube', 'v3', credentials=creds)
     
@@ -590,8 +592,10 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     anl_end_date = datetime.strptime(str(anl_end), "%Y-%m-%d").date() if isinstance(anl_end, str) else anl_end
     use_hybrid = anl_end_date >= (today - timedelta(days=2))
     
+    # [3] 배치 처리 함수 (실패 시 1개씩 재시도하는 안전장치 포함)
     def fetch_batch_data(batch_ids):
         vid_str = ",".join(batch_ids)
+        # 1. Analytics API
         r_v = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
         local_anl = {r[0]:{'v':r[1],'l':r[2],'p':r[3]} for r in r_v.get('rows',[])}
         
@@ -616,14 +620,17 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
         r_dy = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
         local_day = r_dy.get('rows', [])
         
+        # 2. Data API (Realtime/Metadata)
         rt_res = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
         local_rt = {item['id']: item for item in rt_res.get('items',[])}
 
         return local_anl, local_s, local_demo, local_tr, local_kws, local_ctr, local_day, local_rt
 
+    # [4] 메인 루프
     for i in range(0, len(target_ids), 50):
         batch = target_ids[i:i+50]
         
+        # [안전장치] 50개 묶음 시도 -> 실패 시 1개씩 낱개 시도
         try:
             results = fetch_batch_data(batch)
             process_queue = [(batch, results)]
@@ -633,8 +640,9 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 try:
                     res_single = fetch_batch_data([single_id])
                     process_queue.append(([single_id], res_single))
-                except: pass
+                except: pass # 진짜 문제있는 1개만 버림
 
+        # [5] 데이터 집계
         for batch_ids, (l_anl, l_s, l_demo, l_tr, l_kws, l_ctr, l_day, l_rt) in process_queue:
             if l_s: tot_s += l_s[0][0]
             
@@ -663,6 +671,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 if fin_v>0 and a_data['p']>0:
                     w_avg_sum += (fin_v*a_data['p']); v_for_avg += fin_v
                 
+                # 기간 내 조회수 기준으로 100만+ 카운트
                 if fin_v >= 1000000: over_1m += 1
                 
                 if fin_v > 0:
@@ -672,12 +681,15 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                         'views': rt_v, 'period_views': fin_v, 'period_likes': fin_l,
                         'avg_pct': a_data['p'], 'duration_min': dur
                     })
-
-    if not top_vids and tot_v==0: return None
+    
+    # [6] 수정됨: 조회수가 0이어도 영상 개수는 보고해야 함! (return None 삭제)
+    # if not top_vids and tot_v==0: return None  <-- 이 줄이 범인이었습니다.
+    
     top_vids.sort(key=lambda x: x['period_views'], reverse=True)
     
     return {
-        'channel_name': channel_data['name'], 'video_count': len(target_ids),
+        'channel_name': channel_data['name'], 
+        'video_count': len(target_ids), # API가 다 실패해도 이 숫자는 살아남음
         'total_views': tot_v, 'total_likes': tot_l, 'total_shares': tot_s,
         'avg_view_pct': (w_avg_sum/v_for_avg) if v_for_avg>0 else 0,
         'demo_counts': demo, 'traffic_counts': traffic, 'country_counts': country,
