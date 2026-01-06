@@ -564,7 +564,6 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     norm_kw = normalize_text(keyword)
     
     # [1] 필터링 (Keyword & Date)
-    # 중복 제거 및 필터링
     temp_target_ids = [] 
     id_map = {}; date_map = {}
     
@@ -592,55 +591,78 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     anl_end_date = datetime.strptime(str(anl_end), "%Y-%m-%d").date() if isinstance(anl_end, str) else anl_end
     use_hybrid = anl_end_date >= (today - timedelta(days=2))
     
-    # [3] 배치 처리 함수 (실패 시 1개씩 재시도하는 안전장치 포함)
+    # ===== [3] 배치 처리 함수 (병렬 최적화 적용) =====
     def fetch_batch_data(batch_ids):
         vid_str = ",".join(batch_ids)
-        # 1. Analytics API
-        r_v = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
-        local_anl = {r[0]:{'v':r[1],'l':r[2],'p':r[3]} for r in r_v.get('rows',[])}
         
-        r_s = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
-        local_s = r_s.get('rows', [])
-        
-        r_d = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='viewerPercentage', dimensions='ageGroup,gender', filters=f'video=={vid_str}').execute()
-        local_demo = r_d.get('rows', [])
-        
-        r_tr = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceType', filters=f'video=={vid_str}').execute()
-        local_tr = r_tr.get('rows', [])
-        
-        local_kws = []
-        try:
-            r_k = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceDetail', filters=f'video=={vid_str};insightTrafficSourceType==YT_SEARCH', maxResults=15, sort='-views').execute()
-            local_kws = r_k.get('rows', [])
-        except: pass
-        
-        r_c = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='country', filters=f'video=={vid_str}', maxResults=50).execute()
-        local_ctr = r_c.get('rows', [])
-        
-        r_dy = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
-        local_day = r_dy.get('rows', [])
-        
-        # 2. Data API (Realtime/Metadata)
-        rt_res = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
-        local_rt = {item['id']: item for item in rt_res.get('items',[])}
+        # 각 API 요청을 정의 (실행은 하지 않음)
+        def _get_main_metrics():
+            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
+            return {row[0]: {'v': row[1], 'l': row[2], 'p': row[3]} for row in r.get('rows', [])}
 
-        return local_anl, local_s, local_demo, local_tr, local_kws, local_ctr, local_day, local_rt
+        def _get_shares():
+            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
+            return r.get('rows', [])
+
+        def _get_demo():
+            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='viewerPercentage', dimensions='ageGroup,gender', filters=f'video=={vid_str}').execute()
+            return r.get('rows', [])
+
+        def _get_traffic():
+            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceType', filters=f'video=={vid_str}').execute()
+            return r.get('rows', [])
+
+        def _get_keywords():
+            try:
+                r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceDetail', filters=f'video=={vid_str};insightTrafficSourceType==YT_SEARCH', maxResults=15, sort='-views').execute()
+                return r.get('rows', [])
+            except: return []
+
+        def _get_countries():
+            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='country', filters=f'video=={vid_str}', maxResults=50).execute()
+            return r.get('rows', [])
+
+        def _get_daily():
+            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
+            return r.get('rows', [])
+
+        def _get_realtime():
+            r = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
+            return {item['id']: item for item in r.get('items', [])}
+
+        # ThreadPoolExecutor를 사용하여 8개의 요청을 동시에 실행
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            f_main = executor.submit(_get_main_metrics)
+            f_share = executor.submit(_get_shares)
+            f_demo = executor.submit(_get_demo)
+            f_traf = executor.submit(_get_traffic)
+            f_keyw = executor.submit(_get_keywords)
+            f_ctry = executor.submit(_get_countries)
+            f_daily = executor.submit(_get_daily)
+            f_real = executor.submit(_get_realtime)
+
+            # 결과 수집 (여기서 대기 발생, 하지만 병렬이므로 가장 느린 요청 시간만큼만 소요)
+            return (
+                f_main.result(), f_share.result(), f_demo.result(), 
+                f_traf.result(), f_keyw.result(), f_ctry.result(), 
+                f_daily.result(), f_real.result()
+            )
 
     # [4] 메인 루프
     for i in range(0, len(target_ids), 50):
         batch = target_ids[i:i+50]
         
-        # [안전장치] 50개 묶음 시도 -> 실패 시 1개씩 낱개 시도
         try:
             results = fetch_batch_data(batch)
             process_queue = [(batch, results)]
         except:
+            # 배치 실패 시 개별 시도 (안전장치)
             process_queue = []
             for single_id in batch:
                 try:
                     res_single = fetch_batch_data([single_id])
                     process_queue.append(([single_id], res_single))
-                except: pass # 진짜 문제있는 1개만 버림
+                except: pass
 
         # [5] 데이터 집계
         for batch_ids, (l_anl, l_s, l_demo, l_tr, l_kws, l_ctr, l_day, l_rt) in process_queue:
@@ -671,7 +693,6 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                 if fin_v>0 and a_data['p']>0:
                     w_avg_sum += (fin_v*a_data['p']); v_for_avg += fin_v
                 
-                # 기간 내 조회수 기준으로 100만+ 카운트
                 if fin_v >= 1000000: over_1m += 1
                 
                 if fin_v > 0:
@@ -682,14 +703,11 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
                         'avg_pct': a_data['p'], 'duration_min': dur
                     })
     
-    # [6] 수정됨: 조회수가 0이어도 영상 개수는 보고해야 함! (return None 삭제)
-    # if not top_vids and tot_v==0: return None  <-- 이 줄이 범인이었습니다.
-    
     top_vids.sort(key=lambda x: x['period_views'], reverse=True)
     
     return {
         'channel_name': channel_data['name'], 
-        'video_count': len(target_ids), # API가 다 실패해도 이 숫자는 살아남음
+        'video_count': len(target_ids),
         'total_views': tot_v, 'total_likes': tot_l, 'total_shares': tot_s,
         'avg_view_pct': (w_avg_sum/v_for_avg) if v_for_avg>0 else 0,
         'demo_counts': demo, 'traffic_counts': traffic, 'country_counts': country,
