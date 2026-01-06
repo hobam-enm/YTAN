@@ -591,68 +591,57 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
     anl_end_date = datetime.strptime(str(anl_end), "%Y-%m-%d").date() if isinstance(anl_end, str) else anl_end
     use_hybrid = anl_end_date >= (today - timedelta(days=2))
     
-    # ===== [3] 배치 처리 함수 (병렬 최적화 적용) =====
+    # ===== [3] 배치 처리 함수 (순차 처리로 변경 - 안정성 확보) =====
     def fetch_batch_data(batch_ids):
         vid_str = ",".join(batch_ids)
         
-        # 각 API 요청을 정의 (실행은 하지 않음)
-        def _get_main_metrics():
-            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
-            return {row[0]: {'v': row[1], 'l': row[2], 'p': row[3]} for row in r.get('rows', [])}
+        # [수정] 함수 정의 없이 즉시 실행 (ThreadPool 제거)
+        # 하나씩 차례대로 실행하므로 메모리 부하가 적고 안정적입니다.
+        
+        # 1. Main Metrics
+        r_main_raw = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views,likes,averageViewPercentage', dimensions='video', filters=f'video=={vid_str}').execute()
+        r_main = {row[0]: {'v': row[1], 'l': row[2], 'p': row[3]} for row in r_main_raw.get('rows', [])}
 
-        def _get_shares():
-            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
-            return r.get('rows', [])
+        # 2. Shares
+        r_share_raw = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='shares', filters=f'video=={vid_str}').execute()
+        r_share = r_share_raw.get('rows', [])
 
-        def _get_demo():
-            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='viewerPercentage', dimensions='ageGroup,gender', filters=f'video=={vid_str}').execute()
-            return r.get('rows', [])
+        # 3. Demographics
+        r_demo_raw = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='viewerPercentage', dimensions='ageGroup,gender', filters=f'video=={vid_str}').execute()
+        r_demo = r_demo_raw.get('rows', [])
 
-        def _get_traffic():
-            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceType', filters=f'video=={vid_str}').execute()
-            return r.get('rows', [])
+        # 4. Traffic Source
+        r_traf_raw = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceType', filters=f'video=={vid_str}').execute()
+        r_traf = r_traf_raw.get('rows', [])
 
-        def _get_keywords():
-            try:
-                r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceDetail', filters=f'video=={vid_str};insightTrafficSourceType==YT_SEARCH', maxResults=15, sort='-views').execute()
-                return r.get('rows', [])
-            except: return []
+        # 5. Keywords (Error Handling 포함)
+        try:
+            r_kw_raw = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='insightTrafficSourceDetail', filters=f'video=={vid_str};insightTrafficSourceType==YT_SEARCH', maxResults=15, sort='-views').execute()
+            r_keyw = r_kw_raw.get('rows', [])
+        except: 
+            r_keyw = []
 
-        def _get_countries():
-            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='country', filters=f'video=={vid_str}', maxResults=50).execute()
-            return r.get('rows', [])
+        # 6. Countries
+        r_ctry_raw = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='country', filters=f'video=={vid_str}', maxResults=50).execute()
+        r_ctry = r_ctry_raw.get('rows', [])
 
-        def _get_daily():
-            r = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
-            return r.get('rows', [])
+        # 7. Daily Stats
+        r_daily_raw = yt_anl.reports().query(ids='channel==MINE', startDate=anl_start, endDate=anl_end, metrics='views', dimensions='day', filters=f'video=={vid_str}', sort='day').execute()
+        r_daily = r_daily_raw.get('rows', [])
 
-        def _get_realtime():
-            r = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
-            return {item['id']: item for item in r.get('items', [])}
+        # 8. Realtime Data
+        r_real_raw = youtube.videos().list(part='statistics,contentDetails', id=vid_str).execute()
+        r_real = {item['id']: item for item in r_real_raw.get('items', [])}
 
-        # ThreadPoolExecutor를 사용하여 8개의 요청을 동시에 실행
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            f_main = executor.submit(_get_main_metrics)
-            f_share = executor.submit(_get_shares)
-            f_demo = executor.submit(_get_demo)
-            f_traf = executor.submit(_get_traffic)
-            f_keyw = executor.submit(_get_keywords)
-            f_ctry = executor.submit(_get_countries)
-            f_daily = executor.submit(_get_daily)
-            f_real = executor.submit(_get_realtime)
-
-            # 결과 수집 (여기서 대기 발생, 하지만 병렬이므로 가장 느린 요청 시간만큼만 소요)
-            return (
-                f_main.result(), f_share.result(), f_demo.result(), 
-                f_traf.result(), f_keyw.result(), f_ctry.result(), 
-                f_daily.result(), f_real.result()
-            )
+        # 순서대로 리턴 (기존 로직과 동일)
+        return (r_main, r_share, r_demo, r_traf, r_keyw, r_ctry, r_daily, r_real)
 
     # [4] 메인 루프
     for i in range(0, len(target_ids), 50):
         batch = target_ids[i:i+50]
         
         try:
+            # 병렬 실행 없이 직접 호출
             results = fetch_batch_data(batch)
             process_queue = [(batch, results)]
         except:
