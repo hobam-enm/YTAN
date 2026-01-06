@@ -134,7 +134,7 @@ custom_css = """
 """
 st.markdown(custom_css, unsafe_allow_html=True)
 
-MAX_WORKERS = 7
+MAX_WORKERS = 3
 SCOPES = ['https://www.googleapis.com/auth/yt-analytics.readonly', 'https://www.googleapis.com/auth/youtube.readonly']
 DEFAULT_LIMIT_DATE = "2024-01-01"
 
@@ -631,7 +631,7 @@ def process_analysis_channel(channel_data, keyword, vid_start, vid_end, anl_star
             return {item['id']: item for item in r.get('items', [])}
 
         # ThreadPoolExecutor를 사용하여 8개의 요청을 동시에 실행
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             f_main = executor.submit(_get_main_metrics)
             f_share = executor.submit(_get_shares)
             f_demo = executor.submit(_get_demo)
