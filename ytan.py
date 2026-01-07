@@ -484,10 +484,10 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         
         # [설정] 강력한 중복 방지 및 날짜 융통성
         consecutive_cached_count = 0
-        SAFE_BUFFER = 100          # 이미 아는 영상이 1000개 나올 때까지는 멈추지 않음 (완벽 방어)
+        SAFE_BUFFER = 500          # 이미 아는 영상이 1000개 나올 때까지는 멈추지 않음 (완벽 방어)
         
         consecutive_old_count = 0
-        DATE_BUFFER_LIMIT = 20      # 날짜 지난 영상이 20개 연속으로 나와야 멈춤 (순서 꼬임 방어)
+        DATE_BUFFER_LIMIT = 100      # 날짜 지난 영상이 20개 연속으로 나와야 멈춤 (순서 꼬임 방어)
         
         while not stop:
             # [핵심 변경] playlistItems -> search(forMine=True)
