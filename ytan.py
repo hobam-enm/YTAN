@@ -504,7 +504,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
                 
                 # 날짜 제한 체크 (String 비교)
                 if p_at < limit_date: 
-                    stop = True; break
+                    continue
                 
                 if not force_rescan and vid in cached_ids:
                     consecutive_cached_count += 1
