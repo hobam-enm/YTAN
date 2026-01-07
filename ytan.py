@@ -463,17 +463,17 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         
     try:
         youtube = googleapiclient.discovery.build('youtube', 'v3', credentials=creds)
-        ch_res = youtube.channels().list(part='snippet,contentDetails', mine=True).execute()
+        
+        # 채널 이름 가져오기 (이건 기존 API 유지)
+        ch_res = youtube.channels().list(part='snippet', mine=True).execute()
         if not ch_res['items']: return None
-        ch_info = ch_res['items'][0]; ch_name = ch_info['snippet']['title']
-        uploads_id = ch_info['contentDetails']['relatedPlaylists']['uploads']
+        ch_name = ch_res['items'][0]['snippet']['title']
         
         cache_name = f"cache_{os.path.basename(token_file)}"
         
         if force_rescan:
             cached_videos = []
             cached_ids = set()
-            # [디버깅] 실제 적용된 날짜를 눈으로 확인시켜줌 (범인 검거용)
             status_box.info(f"🔥 [{ch_name}] 전체 재수집 시작 (Limit: {limit_date})")
         else:
             cached_videos = load_from_mongodb(cache_name)
@@ -481,31 +481,54 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
             status_box.info(f"🔄 [{ch_name}] DB 확인 ({len(cached_videos)}개)...")
         
         new_videos = []; next_pg = None; stop = False
+        
+        # [설정] 강력한 중복 방지 및 날짜 융통성
         consecutive_cached_count = 0
-        SAFE_BUFFER = 1000 
+        SAFE_BUFFER = 1000          # 이미 아는 영상이 1000개 나올 때까지는 멈추지 않음 (완벽 방어)
+        
+        consecutive_old_count = 0
+        DATE_BUFFER_LIMIT = 20      # 날짜 지난 영상이 20개 연속으로 나와야 멈춤 (순서 꼬임 방어)
         
         while not stop:
-            req = youtube.playlistItems().list(part='snippet', playlistId=uploads_id, maxResults=50, pageToken=next_pg)
+            # [핵심 변경] playlistItems -> search(forMine=True)
+            # type='video': 영상만 검색 / forMine=True: 내 권한으로(비공개, 예약 포함) / order='date': 최신순
+            req = youtube.search().list(
+                part='snippet', 
+                forMine=True, 
+                type='video', 
+                order='date', 
+                maxResults=50, 
+                pageToken=next_pg
+            )
             res = req.execute()
             
             items = res.get('items', [])
             if not items:
-                # 아이템이 없으면 바로 멈추지 말고 페이지 토큰이라도 있는지 확인 (빈 페이지 방지)
                 if not res.get('nextPageToken'):
                     stop = True
                 else:
                     next_pg = res.get('nextPageToken')
-                    time.sleep(0.1) # 과속 방지
+                    time.sleep(0.5) 
                     continue
             
             for item in items:
-                vid = item['snippet']['resourceId']['videoId']
+                # [구조 변경] search API는 id 구조가 다릅니다.
+                vid = item['id']['videoId']
                 p_at = item['snippet']['publishedAt']
                 
-                # 날짜 제한 체크 (String 비교)
+                # [1] 날짜 제한 체크 (Smart Break 적용)
                 if p_at < limit_date: 
-                    continue
-                
+                    consecutive_old_count += 1
+                    if consecutive_old_count >= DATE_BUFFER_LIMIT:
+                        status_box.caption(f"✋ 날짜 제한 도달 (연속 {DATE_BUFFER_LIMIT}개 초과). 수집 종료.")
+                        stop = True
+                        break
+                    # 20개 안쪽이면 그냥 무시하고 계속 탐색 (순서 꼬임 대비)
+                    continue 
+                else:
+                    consecutive_old_count = 0 # 날짜 통과하면 카운트 리셋
+
+                # [2] 중복 체크 (SAFE_BUFFER 적용)
                 if not force_rescan and vid in cached_ids:
                     consecutive_cached_count += 1
                     if consecutive_cached_count >= SAFE_BUFFER:
@@ -514,7 +537,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
                         break
                     continue 
                 else:
-                    consecutive_cached_count = 0
+                    consecutive_cached_count = 0 # 새 영상 나오면 카운트 리셋
                     new_videos.append({
                         'id': vid, 
                         'title': item['snippet']['title'], 
@@ -522,22 +545,21 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
                         'description': item['snippet']['description']
                     })
             
-            if len(new_videos) > 0 and len(new_videos)%50==0:
+            if len(new_videos) > 0 and len(new_videos) % 50 == 0:
                 status_box.markdown(f"🏃 **[{ch_name}]** +{len(new_videos)}")
             
             next_pg = res.get('nextPageToken')
             if not next_pg: stop = True
             
-            # [핵심 수정] 과속 방지 턱 (API 누락 방지)
-            time.sleep(0.3)
+            # search API는 비용이 비싸므로(1회 100점), 과속 방지 딜레이를 약간 더 줍니다.
+            time.sleep(0.5)
         
         if force_rescan:
             final_list = new_videos
         else:
             final_list = new_videos + cached_videos
             
-        # [핵심 수정] 최종 저장 전 중복 제거 (Clean Data)
-        # ID가 같은 녀석이 있으면 하나만 남김
+        # 중복 제거 (혹시 모를 중복 방지)
         final_list = list({v['id']:v for v in final_list}.values())
         
         is_ok, msg = save_to_mongodb(cache_name, final_list)
