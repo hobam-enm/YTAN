@@ -482,7 +482,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         
         new_videos = []; next_pg = None; stop = False
         consecutive_cached_count = 0
-        SAFE_BUFFER = 200 
+        SAFE_BUFFER = 1000 
         
         while not stop:
             req = youtube.playlistItems().list(part='snippet', playlistId=uploads_id, maxResults=50, pageToken=next_pg)
