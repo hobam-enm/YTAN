@@ -136,7 +136,7 @@ st.markdown(custom_css, unsafe_allow_html=True)
 
 MAX_WORKERS = 3
 SCOPES = ['https://www.googleapis.com/auth/yt-analytics.readonly', 'https://www.googleapis.com/auth/youtube.readonly']
-DEFAULT_LIMIT_DATE = "2024-01-01"
+DEFAULT_LIMIT_DATE = "2010-01-01"
 
 ISO_MAPPING = {
     'KR': 'KOR', 'US': 'USA', 'JP': 'JPN', 'VN': 'VNM', 'TH': 'THA', 
@@ -482,7 +482,7 @@ def process_sync_channel(token_file, limit_date, status_box, force_rescan):
         
         new_videos = []; next_pg = None; stop = False
         consecutive_cached_count = 0
-        SAFE_BUFFER = 50 
+        SAFE_BUFFER = 200 
         
         while not stop:
             req = youtube.playlistItems().list(part='snippet', playlistId=uploads_id, maxResults=50, pageToken=next_pg)
